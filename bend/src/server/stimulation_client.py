@@ -16,10 +16,17 @@ The intended flow (driven by the frontend SequencePlayer) is:
       (an infinite train that runs until explicitly stopped)
     - on leaving the "move" phase -> stop()
 
-Stimulation parameters (channels, amplitude, pulse width, frequency, ...) are
-defined in the PatientGUI frontend and passed straight through to the
-controller. Failures are swallowed and reported, never raised, so a missing or
-unreachable stimulator never interrupts the EMG recording session.
+This module is deliberately dumb: it is transport, not policy. Nothing here
+validates parameters, tracks whether a train is running, or ever stops one on
+its own — an infinite train really does run until someone sends the DELETE.
+Everything that makes that safe (parameter limits, ownership, the dead-man
+deadline, stop retries, stop on disconnect / device loss / shutdown) lives in
+`stim_authority.StimAuthority`, which wraps this client and is the only thing
+the servers call. Do not add call sites that bypass it.
+
+Failures are swallowed and reported, never raised, so a missing or unreachable
+stimulator never interrupts the EMG recording session — the authority is what
+turns a reported failure into a retry and an alarm.
 """
 
 import logging
@@ -47,7 +54,12 @@ class StimulationClient:
         self.stimulator_type = stimulator_type
         self.port = port
         self.timeout = timeout
-        # Whether we believe a stimulation we started is currently running.
+        # Per-call bookkeeping only: True after a PUT that returned 2xx, False
+        # after a DELETE that did. NOT an interlock and NOT the server's belief
+        # about the hardware — a failed stop leaves this False while the train
+        # is still running, which is exactly the trap audit S2 flagged. The
+        # authoritative flag is `StimAuthority.active`; nothing should read this
+        # one. Kept only so this client stays usable standalone (scripts, REPL).
         self.active = False
 
     def _url(self, override: Optional[str], path: str) -> str:
