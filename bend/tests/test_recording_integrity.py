@@ -921,6 +921,184 @@ def test_sim_server_last_client_disconnect_finalizes():
         arun(lambda: scenario(output))
 
 
+# ── movement captures survive a disconnect too (QA F1) ──────────────────────
+
+def test_last_client_disconnect_saves_the_movement_capture_as_interrupted():
+    """`_mv_raw` is RAM-only; nobody left means no mv_record_stop will arrive."""
+    if not HAVE_NUMPY:
+        return _skip("mv capture on disconnect")
+
+    async def scenario(output):
+        srv = _server(output)
+        await srv.handle_message(
+            '{"command": "mv_record_start", "label": "block1", '
+            '"session": "S1", "class_order": ["rest", "grip"]}', Sock())
+        srv._mv_raw = [_chunk(4, 10), _chunk(4, 10, start=40)]
+        ok(srv._mv_capturing is True, "a movement capture is in progress")
+
+        await srv.handle_client(_EmptySocket("only"))
+
+        saved = [n for n in os.listdir(output) if n.startswith("mv_")
+                 and n.endswith(".pkl")]
+        ok(saved, f"the interrupted block was written to disk ({saved})")
+        ok(any("_interrupted" in n for n in saved),
+           f"and the filename says so ({saved})")
+
+        block = [n for n in saved if "_interrupted" in n][0]
+        with open(os.path.join(output, block), "rb") as f:
+            payload = pickle.load(f)
+        ok(payload.get("interrupted") is True,
+           "the file carries interrupted=True, so training code can filter it")
+        ok(payload.get("interrupted_reason") == "client_disconnect",
+           f"and why ({payload.get('interrupted_reason')})")
+        ok(payload["data"].shape == (4, 20),
+           f"with the captured samples ({payload['data'].shape})")
+
+        ok(srv._mv_capturing is False and srv._mv_raw == []
+           and srv._mv_paused is False,
+           "capture state is cleared so a reconnecting client starts clean")
+
+        # A reconnecting client must be able to start a NEW capture, not be
+        # refused by the already-in-progress guard.
+        sock = Sock("reconnected")
+        await srv.handle_message('{"command": "mv_record_start"}', sock)
+        ok(not sock.sent, "a reconnecting client's mv_record_start is accepted")
+        ok(srv._mv_capturing is True, "and a fresh capture is running")
+
+    with _Workspace() as output:
+        arun(lambda: scenario(output))
+
+
+def test_mv_record_stop_without_a_capture_is_harmless():
+    """The frontend's reset() can send it on a closed capture."""
+    async def scenario(output):
+        srv = _server(output)
+        ok(srv._mv_capturing is False, "no capture is running")
+
+        srv.sent.clear()
+        await srv.handle_message('{"command": "mv_record_stop"}', Sock())
+
+        ok(srv._mv_capturing is False and srv._mv_raw == [],
+           "mv_record_stop on nothing changes nothing")
+        ok(srv._mv_last_raw is None, "and produces no phantom block")
+        ok(not [n for n in os.listdir(output) if n.startswith("mv_")],
+           "nothing is written to disk")
+        states = [m.get("state") for m in srv.sent
+                  if m.get("type") == "mv_train_status"]
+        ok(states == ["recorded"] and
+           all(m.get("n_samples", 0) == 0 for m in srv.sent
+               if m.get("type") == "mv_train_status"),
+           f"it acks with an empty block rather than erroring ({states})")
+
+    with _Workspace() as output:
+        arun(lambda: scenario(output))
+
+
+def test_orphaned_online_capture_is_interpretable():
+    """A crash before mv_online_stop must still leave a readable .raw."""
+    if not HAVE_NUMPY:
+        return _skip("orphaned online capture")
+
+    async def scenario(output):
+        srv = _server(output)
+        await srv.handle_message(
+            '{"command": "mv_online_start", "session": "S1", '
+            '"class_order": ["rest", "grip"]}', Sock())
+
+        raw_path = srv._mv_online_path
+        ok(raw_path and os.path.exists(raw_path), "the .raw is created at start")
+        ok(os.path.exists(rr.online_sidecar_path(raw_path)),
+           "and its sidecar exists from the very start, before any chunk")
+
+        chunk = _chunk(4, 10, dtype="float32")
+        srv._mv_online_file.write(
+            np.ascontiguousarray(chunk.T, dtype=np.float32).tobytes())
+        srv._mv_online_file.flush()
+        srv._mv_online_nsamp += 10
+
+        # Crash: the handle is never closed and mv_online_stop never arrives.
+        leaked = srv._mv_online_file
+
+        info = rr.read_online_sidecar(raw_path)
+        ok(info["kind"] == rr.ONLINE_KIND, "the sidecar identifies the artefact")
+        ok(info["complete"] is False,
+           "and is honestly marked incomplete: the run was never closed")
+        ok(info["n_channels"] == 4 and info["dtype"] == "float32",
+           "it carries the shape and dtype needed to reshape the file")
+
+        data = np.fromfile(raw_path, dtype=np.dtype(info["dtype"]))
+        data = data.reshape(-1, info["n_channels"]).T
+        ok(np.array_equal(data, chunk),
+           "and the documented reshape recovers the samples exactly")
+
+        ok(rr.find_online_captures(output) == [raw_path],
+           "--list discovery finds the orphan")
+        ok(rr.main(["--list", output]) == 0,
+           "and --list runs over a folder holding one")
+
+        leaked.close()
+
+    with _Workspace() as output:
+        arun(lambda: scenario(output))
+
+
+def test_last_client_disconnect_closes_the_online_writer():
+    """The sidecar must be refreshed with the real counts, not left at start."""
+    if not HAVE_NUMPY:
+        return _skip("online writer on disconnect")
+
+    async def scenario(output):
+        srv = _server(output)
+        await srv.handle_message(
+            '{"command": "mv_online_start", "session": "S1"}', Sock())
+        raw_path = srv._mv_online_path
+        srv._mv_online_file.write(
+            np.ascontiguousarray(_chunk(4, 10, dtype="float32").T,
+                                 dtype=np.float32).tobytes())
+        srv._mv_online_nsamp += 10
+
+        await srv.handle_client(_EmptySocket("only"))
+
+        info = rr.read_online_sidecar(raw_path)
+        ok(info["complete"] is True,
+           "the online run is closed and marked complete on disconnect")
+        ok(info["n_samples"] == 10,
+           f"with the real sample count ({info['n_samples']})")
+        ok(srv._mv_online_file is None and srv._mv_online_capturing is False,
+           "and the writer state is cleared")
+
+    with _Workspace() as output:
+        arun(lambda: scenario(output))
+
+
+def test_double_online_start_does_not_orphan_the_first_run():
+    """Restarting a run must close the previous one properly, sidecar and all."""
+    if not HAVE_NUMPY:
+        return _skip("double online start")
+
+    async def scenario(output):
+        srv = _server(output)
+        await srv.handle_message(
+            '{"command": "mv_online_start", "session": "A"}', Sock())
+        first = srv._mv_online_path
+        srv._mv_online_file.write(
+            np.ascontiguousarray(_chunk(4, 10, dtype="float32").T,
+                                 dtype=np.float32).tobytes())
+        srv._mv_online_nsamp += 10
+
+        srv._open_online_writer({"session": "B"})       # a second start
+        ok(srv._mv_online_path != first, "a new run file is opened")
+
+        info = rr.read_online_sidecar(first)
+        ok(info["complete"] is True and info["n_samples"] == 10,
+           "the first run was closed properly rather than orphaned")
+
+        srv._mv_online_file.close()
+
+    with _Workspace() as output:
+        arun(lambda: scenario(output))
+
+
 TESTS = [
     test_spool_is_written_incrementally_and_nothing_is_kept_in_ram,
     test_saved_file_matches_the_pre_spool_format,
@@ -946,6 +1124,12 @@ TESTS = [
     test_listing_flags_post_save_debris,
     test_safe_name_is_length_capped,
     test_sim_server_last_client_disconnect_finalizes,
+    # Movement captures on disconnect (frontend QA F1)
+    test_last_client_disconnect_saves_the_movement_capture_as_interrupted,
+    test_mv_record_stop_without_a_capture_is_harmless,
+    test_orphaned_online_capture_is_interpretable,
+    test_last_client_disconnect_closes_the_online_writer,
+    test_double_online_start_does_not_orphan_the_first_run,
 ]
 
 
