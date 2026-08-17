@@ -16,9 +16,13 @@ stimulation authority from audit S8 as `d3a90de..3426ffd`) — including a minim
 B2: a shared status banner visible in patient mode, wired to the stimulation/device
 channels. A1–A4 were implemented, adversarially QA'd, and hardened (failed-stop retry,
 watchdog fault-latches, reconnect rehydration). The bench verification under "Verify
-Phase A" still needs to be run with a scope on a dummy load. Phases B (beyond the banner
-slice) through H remain outstanding; read `docs/ARCHITECTURE_AUDIT.md` before each — the
-audit's priority stack supersedes this plan's ordering.
+Phase A" still needs to be run with a scope on a dummy load.
+
+**B1 is also complete** (both halves — the disconnect side landed with the
+recording-integrity package, `e800db9..1eb5c19`), plus slices of B2 (the banner) and B3
+(`recording_warning` surfaced instead of dropped). B4–B7 and Phases C–H remain
+outstanding; read `docs/ARCHITECTURE_AUDIT.md` before each — the audit's priority stack
+supersedes this plan's ordering.
 
 ---
 

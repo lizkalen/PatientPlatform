@@ -492,8 +492,15 @@ The two existing plans stay valid; this reorders around them.
    clinical review of the `StimLimits` ceilings, and the bench tests in the scope note
    below (samolator behaviour on client death, retry-give-up visibility, Windows Ctrl+C
    teardown).
-3. **Recording integrity (P5, B1, B2):** incremental flush, `_mv_paused` fix, recording
-   state in the connect payload, sidecar-first online writer, filename collision fix.
+3. **Recording integrity (P5, B1, B2)** — done (`e800db9..1eb5c19`: implementation,
+   adversarial QA with empirical repros, and fix rounds). Recordings spool to disk with
+   per-chunk flush and recover via `python -m server.recover_recording`; movement
+   captures are saved (marked `interrupted`) on last-client disconnect; the frontend
+   halts visibly on a drop. Accepted residuals, stated in-source: `_mv_raw` lives in RAM
+   between chunks (a hard kill mid-block still loses it — the spool helpers are the
+   named follow-up); `recording.decomp.sources` remains unbounded (untouched); with a
+   second client still connected, nothing finalizes on one client's disconnect — a
+   consequence of the open multi-client model (item 6 below).
 4. **Process lifecycle (P1–P3):** fix or replace the launchers; port-bind failure must be
    loud; add the missing install step; restore/replace the sim data file.
 5. **The dedup pass (D1, D2, D4, D5–D7):** sim fork → `SimulatedDevice` factory; one CLI;
