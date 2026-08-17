@@ -47,6 +47,10 @@ export const SESSION = {
 	SENSOR_DONE: 'sensor_done',         // sensor pass complete; offer live control
 	ONLINE: 'online',
 	DONE: 'done',
+	// TERMINAL. Entered by emergencyStop() and left ONLY by reset() — an explicit
+	// operator action. No automatic transition may leave it, and no cueing, sequence
+	// or stim may be armed while it is set (fend plan A1).
+	HALTED: 'halted',
 	ERROR: 'error',
 };
 
@@ -74,6 +78,12 @@ export default class MovementSessionController {
 		// plus a get-ready countdown before each, so reps don't run fully back-to-back.
 		this.onlineRestSec = options.onlineRestSec ?? 2;
 		this.onlinePrepSec = options.onlinePrepSec ?? 1;
+		// Redundant hard stop for a sensor-pass train. The intended stop is a single
+		// setTimeout armed on the leave-MOVE transition; if that transition never
+		// arrives (player stalled, config swapped, socket dropped) nothing else turns
+		// the train off. This fires at the longest legitimate bout + the configured
+		// hold, i.e. slightly after any real train should already have ended.
+		this.maxTimedStimMs = options.maxTimedStimMs ?? 15000;
 		this._sessionConfig = null;                 // the live config captured at session start
 		this.montage = { perGrid: 64, nGrids: 3 };  // EMG grid layout (drives good-mask + features)
 		this.deviceInfo = '';                       // device/channel feedback for the UI
@@ -86,6 +96,15 @@ export default class MovementSessionController {
 		this._stimStartTimer = null;                // fires stim preStimDelayMs after move start
 		this._stimStopTimer = null;                 // stops stim postStimHoldMs after move end
 		this._sensorFinalizeTimer = null;           // finalizes the pass after the last stim hold
+		this._hardStopTimer = null;                 // watchdog: unconditional stop for a timed train
+		this._pendingStimStop = false;              // a timed-stim stop that never reached the server
+
+		// Emergency-stop latch. Terminal: only reset() clears it. Every path that could
+		// arm stimulation again bails on it, so a STOP cannot be undone by the sequence
+		// simply advancing to the next MOVE phase (fend plan A1).
+		this._halted = false;
+		this._haltedFrom = null;                    // state at halt time (reset() closes its capture)
+		this._alarmListeners = [];                  // operator-visible alarms -> status banner
 
 		this.state = SESSION.WELCOME;
 		this.message = '';
@@ -133,6 +152,17 @@ export default class MovementSessionController {
 	setConfig(config) { this.baseConfig = config; }
 	onChange(cb) { this._listeners.push(cb); }
 
+	/** Subscribe to operator-visible stim alarms. Called with a message string. */
+	onAlarm(cb) { this._alarmListeners.push(cb); }
+
+	_raiseAlarm(message) {
+		console.warn('[MovementSession] ALARM:', message);
+		this.trainLog.push({ t: Date.now(), level: 'error', line: message });
+		for (const cb of this._alarmListeners) {
+			try { cb(message); } catch (e) { console.error('MovementSession alarm listener error', e); }
+		}
+	}
+
 	/** The live sequence config the user edited via the panel (loaded into the
 	 * player), falling back to the static default only if none is present. */
 	_config() { return this.player?.config || this.baseConfig; }
@@ -171,6 +201,7 @@ export default class MovementSessionController {
 			// Sensor-triggered pass: cued movement + timed-stim state + configured delays.
 			sensorStim: this._sensorStim,
 			sensorLabel: this._sensorLabel,
+			halted: this._halted,
 			preStimDelayMs: this.preStimDelayMs,
 			postStimHoldMs: this.postStimHoldMs,
 		};
@@ -458,10 +489,15 @@ export default class MovementSessionController {
 		this._set(SESSION.DONE, 'Session complete.');
 	}
 
-	/** Restart from the top (after done/error). */
+	/** Restart from the top (after done/error/halt). This is the ONLY thing that clears
+	 * the emergency-stop latch — an explicit operator action, never a state transition. */
 	reset() {
+		// A halt froze the state machine at HALTED, but the capture that was open when
+		// STOP was pressed is still open on the server. Close it against the state we
+		// halted FROM, not against HALTED.
+		const from = this._halted ? this._haltedFrom : this.state;
 		this._clearSensorTimers();
-		this._stopTimedStim();
+		this._stopTimedStim({ force: this._halted });
 		this.stim?.disable();
 		try { this.player.stop(); } catch (e) { /* noop */ }
 		// Release recording control AFTER stopping, so the stop above stays silent and
@@ -474,15 +510,17 @@ export default class MovementSessionController {
 		// No mvRecordResume() first: the server's pause flag only gates appending, and
 		// stop works while paused — resuming would re-admit the tutorial-phase samples
 		// we deliberately excluded, in the window before the stop lands.
-		if (this.state === SESSION.RECORD_TRAIN || this.state === SESSION.RECORD_CLEAN
-			|| this.state === SESSION.RECORD_CALIB) {
+		if (from === SESSION.RECORD_TRAIN || from === SESSION.RECORD_CLEAN
+			|| from === SESSION.RECORD_CALIB) {
 			this._mvPaused = false;
 			this.client.mvRecordStop();
 		}
 		// Save any live run — both free online and the sensor pass capture via mv_online.
-		if (this.state === SESSION.ONLINE || this.state === SESSION.SENSOR_SIM) this.client.mvOnlineStop();
+		if (from === SESSION.ONLINE || from === SESSION.SENSOR_SIM) this.client.mvOnlineStop();
 		this._sensorStim = null;
 		this._calibThenOnline = false;
+		this._halted = false;
+		this._haltedFrom = null;
 		this.mode?.setMode('config');
 		this._derived = null;
 		this._calibSequence = null;
@@ -491,17 +529,40 @@ export default class MovementSessionController {
 		this._set(SESSION.WELCOME, '');
 	}
 
-	/** Operator emergency stop — halt all stimulation immediately. */
+	/**
+	 * Operator emergency stop — TERMINAL. Halts stimulation, stops the player, and
+	 * latches `_halted` so nothing re-arms stim until the operator calls reset().
+	 *
+	 * Both stops are UNCONDITIONAL: a stale `_sensorStimOn`/`stimming === false` (a
+	 * reconnect reinitialises them, and another driver may own the live train) must
+	 * never suppress the command (audit S5). Cheap duplicate stops are the correct
+	 * trade against a train that keeps running.
+	 */
 	emergencyStop() {
+		this._halted = true;
+		if (this._haltedFrom == null) this._haltedFrom = this.state;
 		this._clearSensorTimers();
-		this._stopTimedStim();
+		this._stopTimedStim({ force: true });   // the sensor pass drives the stimulator directly
+		this.stim?.emergencyStop();             // the closed loop drives it through the controller
+		// Stop the cueing too: without this the sequence keeps running and the next MOVE
+		// phase re-arms the timed stim 1-2 s later.
+		this._onSeqComplete = null;             // a late completion must not restart anything
+		try { this.player.stop(); } catch (e) { /* noop */ }
 		this._sensorStim = 'rest';
-		this.stim?.emergencyStop();
-		this._emit();
+		this._set(SESSION.HALTED,
+			'EMERGENCY STOP — stimulation halted and cueing stopped. Reset to start a new session.');
 	}
 
 	// -- sequence running ---------------------------------------------------------
 	_runSequence(config, onComplete) {
+		// Terminal halt: no block may be cued (and therefore no stim armed) until the
+		// operator resets. Nothing in the halted view offers this, so reaching it means
+		// a stale control — refuse loudly rather than silently re-arming.
+		if (this._halted) {
+			this._raiseAlarm('Refused to start a block: the session is HALTED — reset it first.');
+			this._emit();
+			return;
+		}
 		this._onSeqComplete = onComplete;
 		this._mvPaused = false;         // capture resumes fresh for each block
 		// We bracket every block with our own mv_record_*/mv_online_* capture, so the
@@ -594,6 +655,7 @@ export default class MovementSessionController {
 	/** Phase transitions during the sensor pass -> schedule the timed stim. Stim starts
 	 * `preStimDelayMs` after the movement begins and stops `postStimHoldMs` after it ends. */
 	_onSensorPhase(prev, phase) {
+		if (this._halted) return;   // emergency stop is terminal: never re-arm from a phase change
 		const enteringMove = phase === PHASE.MOVE && prev !== PHASE.MOVE;
 		const leavingMove = prev === PHASE.MOVE && phase !== PHASE.MOVE;
 		if (enteringMove) {
@@ -630,6 +692,7 @@ export default class MovementSessionController {
 	/** Fire the cued movement's stim pattern (+ trigger channel) like a sensor would. */
 	_startTimedStim(label) {
 		this._stimStartTimer = null;
+		if (this._halted) return;   // emergency stop is terminal: never arm stim again
 		const { stimCfg } = this._resolvePatterns();
 		const channels = this._sensorStimChannels(label);
 		if (!channels?.length) {
@@ -639,29 +702,74 @@ export default class MovementSessionController {
 			this._emit();
 			return;
 		}
-		this.client.stimulateStart({
+		const sent = this.client.stimulateStart({
 			channels: this._withTriggerChannel(channels),
 			stimulatorType: stimCfg.stimulatorType,
 			port: stimCfg.port,
 			controllerUrl: stimCfg.controllerUrl,
 		});
+		if (!sent) return;   // never left the socket: nothing is running, so claim nothing
 		this._sensorStimOn = true;
 		this._sensorStim = 'stim';
+		this._armHardStop();
 		this._emit();
 	}
 
-	/** Stop the timed stim train if one is running (idempotent). */
-	_stopTimedStim() {
-		if (!this._sensorStimOn) return;
-		this._sensorStimOn = false;
+	/**
+	 * Redundant, unconditional stop for the train just started — the backstop for a
+	 * leave-MOVE transition that never arrives. Cleared by every normal stop path.
+	 *
+	 * Firing is a FAULT, not a normal boundary: the phase machinery that should have
+	 * ended this train is not working, so the very next MOVE phase would arm another
+	 * one. It therefore halts the whole session (same terminal latch as the operator's
+	 * emergency stop) rather than just cutting this train — re-arming needs reset().
+	 */
+	_armHardStop() {
+		this._clearHardStopTimer();
+		this._hardStopTimer = setTimeout(() => {
+			this._hardStopTimer = null;
+			if (!this._sensorStimOn) return;
+			this._raiseAlarm(`STIM WATCHDOG — timed train ran past ${this.maxTimedStimMs
+				+ this.postStimHoldMs} ms. Stop forced and the session HALTED; reset to continue.`);
+			this.emergencyStop();
+		}, this.maxTimedStimMs + this.postStimHoldMs);
+	}
+
+	/**
+	 * Stop the timed stim train (idempotent).
+	 *
+	 * `_sensorStimOn` is cleared ONLY on a confirmed send: a dead socket leaves the
+	 * train running server-side, so the flag stays set, the stop is latched for the
+	 * next connect and the operator is alarmed (fend plan A2).
+	 *
+	 * @param {object} [opts]
+	 * @param {boolean} [opts.force] - send regardless of local belief (emergency stop)
+	 * @returns {boolean} whether the command left the socket
+	 */
+	_stopTimedStim({ force = false } = {}) {
+		this._clearHardStopTimer();
+		if (!force && !this._sensorStimOn && !this._pendingStimStop) return true;
 		const { stimCfg } = this._resolvePatterns();
-		this.client.stimulateStop({ controllerUrl: stimCfg.controllerUrl });
+		const sent = this.client.stimulateStop({ controllerUrl: stimCfg.controllerUrl });
+		if (sent) {
+			this._sensorStimOn = false;
+			this._pendingStimStop = false;
+		} else {
+			this._pendingStimStop = true;
+			this._raiseAlarm('STOP NOT SENT — no connection to the server; stimulation may still be running');
+		}
+		return sent;
+	}
+
+	_clearHardStopTimer() {
+		if (this._hardStopTimer) { clearTimeout(this._hardStopTimer); this._hardStopTimer = null; }
 	}
 
 	_clearSensorTimers() {
 		if (this._stimStartTimer) { clearTimeout(this._stimStartTimer); this._stimStartTimer = null; }
 		if (this._stimStopTimer) { clearTimeout(this._stimStopTimer); this._stimStopTimer = null; }
 		if (this._sensorFinalizeTimer) { clearTimeout(this._sensorFinalizeTimer); this._sensorFinalizeTimer = null; }
+		this._clearHardStopTimer();
 	}
 
 	// -- subscriptions ------------------------------------------------------------
@@ -694,6 +802,12 @@ export default class MovementSessionController {
 			}
 		});
 		this.player.onChange(bump);
+
+		// A timed-stim stop that never left the socket is retried as soon as there is a
+		// connection again — the train it was meant to end is still running.
+		this.client.onConnect?.(() => {
+			if (this._pendingStimStop) this._stopTimedStim({ force: true });
+		});
 
 		this.client.onMvTrainStatus((msg) => this._onTrainStatus(msg));
 		this.client.onConfigStatus?.((msg) => this._onConfigStatus(msg));
@@ -884,7 +998,17 @@ export default class MovementSessionController {
 	}
 
 	// -- state emit ---------------------------------------------------------------
+	/** The single chokepoint for state transitions — and therefore where HALTED is made
+	 * terminal. While the latch is set nothing may transition out of it; only reset(),
+	 * which clears the latch first, can. This is what keeps the STOP confirmation on
+	 * screen (fend plan B5) instead of being overwritten by the next status message. */
 	_set(state, message = '') {
+		if (this._halted && state !== SESSION.HALTED) {
+			this.trainLog.push({ t: Date.now(), level: 'warn',
+				line: `Ignored transition to "${state}" — session is HALTED (reset to continue).` });
+			this._emit();
+			return;
+		}
 		this.state = state;
 		this.message = message;
 		if (state !== SESSION.ERROR) this.error = null;
@@ -893,6 +1017,11 @@ export default class MovementSessionController {
 
 	_fail(message) {
 		this.error = message;
+		if (this._halted) {   // a halt outranks a background failure; keep the STOP on screen
+			this.trainLog.push({ t: Date.now(), level: 'error', line: `ERROR while halted: ${message}` });
+			this._emit();
+			return;
+		}
 		this.state = SESSION.ERROR;
 		this.message = message;
 		this._emit();

@@ -112,7 +112,8 @@ export default class MovementSessionView {
 			[SESSION.SENSOR_SIM]: 'Step 6 of 7 · Sensor run',
 			[SESSION.SENSOR_DONE]: 'Step 6 of 7 · Sensor done',
 			[SESSION.ONLINE]: 'Step 7 of 7 · Live',
-			[SESSION.DONE]: 'Complete', [SESSION.ERROR]: 'Error',
+			[SESSION.DONE]: 'Complete', [SESSION.HALTED]: 'Halted · Emergency stop',
+			[SESSION.ERROR]: 'Error',
 		};
 		this.step.textContent = STEP[snap.state] || '';
 		if (snap.state === this._renderedState) { this._updateSame(snap); return; }
@@ -196,7 +197,9 @@ export default class MovementSessionView {
 				b.appendChild(this._refs.head);
 				this._buildBars(b);
 				const bar = this._bar();
-				this._btn(bar, 'STOP', () => { this.c.emergencyStop(); this._refs.big.textContent = 'STIM STOPPED'; }, 'danger');
+				// emergencyStop() moves the session to HALTED, which re-renders this panel
+				// into the sticky "STIM STOPPED" screen — no local text write to be erased.
+				this._btn(bar, 'STOP', () => this.c.emergencyStop(), 'danger');
 				this._stimModeBtn(bar);
 				this._btn(bar, 'Skip to live', () => this.c.skipToOnline(), 'ghost');
 				b.appendChild(bar);
@@ -216,7 +219,9 @@ export default class MovementSessionView {
 				b.appendChild(this._refs.big);
 				this._buildBars(b);
 				const bar = this._bar();
-				this._btn(bar, 'STOP', () => { this.c.emergencyStop(); this._refs.big.textContent = 'STIM STOPPED'; }, 'danger');
+				// emergencyStop() moves the session to HALTED, which re-renders this panel
+				// into the sticky "STIM STOPPED" screen — no local text write to be erased.
+				this._btn(bar, 'STOP', () => this.c.emergencyStop(), 'danger');
 				this._stimModeBtn(bar);
 				this._btn(bar, 'End', () => this.c.endSession(), 'ghost');
 				b.appendChild(bar);
@@ -225,6 +230,21 @@ export default class MovementSessionView {
 			case SESSION.DONE: {
 				b.appendChild(this._line('Session complete.'));
 				this._btn(this._append(this._bar()), 'New session', () => this.c.reset());
+				break;
+			}
+			// Terminal halt. This screen is the emergency stop's confirmation and it must
+			// STAY: the state cannot change until reset(), and _onDecision returns early
+			// while it is up, so the ~15 Hz decision stream can no longer erase it
+			// (fend plan B5).
+			case SESSION.HALTED: {
+				const big = this._line('STIM STOPPED', 1, '#e0555a');
+				Object.assign(big.style, { fontSize: '26px', fontWeight: '800',
+					textTransform: 'uppercase', margin: '2px 0 6px' });
+				b.appendChild(big);
+				b.appendChild(this._line(snap.message || 'Emergency stop — stimulation halted.', 0.85));
+				b.appendChild(this._line('The session stays halted until you reset it. Check the patient and '
+					+ 'the stimulator, and confirm the banner shows no stim alarm, before continuing.', 0.6));
+				this._btn(this._append(this._bar()), 'Reset session', () => this.c.reset(), 'ghost');
 				break;
 			}
 			case SESSION.ERROR: {
@@ -241,7 +261,7 @@ export default class MovementSessionView {
 		SESSION.RECORD_TRAIN, SESSION.TRAINING, SESSION.TRAINED, SESSION.RECORD_CLEAN,
 		SESSION.TRAINING_CLEAN, SESSION.TRAINED_CLEAN, SESSION.RECORD_CALIB,
 		SESSION.CALIBRATING, SESSION.SENSOR_READY, SESSION.SENSOR_SIM, SESSION.SENSOR_DONE,
-		SESSION.ONLINE, SESSION.ERROR,
+		SESSION.ONLINE, SESSION.HALTED, SESSION.ERROR,
 	]);
 
 	/** Build the training-log panel for the current state (once per state entry). */
@@ -428,6 +448,10 @@ export default class MovementSessionView {
 	}
 
 	_onDecision(d) {
+		// A halted session outranks the decision stream. Without this, the ~15 Hz
+		// predictions overwrite the "STIM STOPPED" confirmation within ~60 ms and the
+		// operator is shown a live-looking readout for a session that is stopped.
+		if (this.c?.state === SESSION.HALTED) return;
 		if ((this._renderedState !== SESSION.ONLINE && this._renderedState !== SESSION.SENSOR_SIM) || !this._refs.bars) return;
 		const order = this._plan.classOrder || [];
 		const label = order[d.pred] ?? '—';
