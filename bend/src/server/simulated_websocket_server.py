@@ -46,6 +46,7 @@ from server.decomposition_manager import DecompositionManager
 from server.movement_classifier_manager import MovementClassifierManager
 from server.movement_training import MovementTrainer
 from server.stimulation_client import StimulationClient
+from server.stim_authority import StimAuthority, DEFAULT_MAX_TRAIN_SECONDS
 
 
 CLOCK_RATE = 30_000  # Match Ripple's clock rate for time conversion
@@ -114,6 +115,8 @@ class SimulatedWebSocketServer:
         filter_lowcut: float = 20.0,
         filter_highcut: float = 500.0,
         filter_notch: float = 50.0,
+        stim_controller_url: Optional[str] = None,
+        stim_max_seconds: float = DEFAULT_MAX_TRAIN_SECONDS,
     ):
         self.npz_path = npz_path
         self.host = host
@@ -169,9 +172,21 @@ class SimulatedWebSocketServer:
         self._mv_last_raw = None
         self._trig_monitor_ch = None      # channel index to live-plot, or None
 
-        # Stimulation client (forwards start/stop to the external stimulator
-        # controller; configured per-command from the frontend).
-        self.stim = StimulationClient()
+        # Stimulation authority — the SAME class the live server uses, so stim
+        # policy is not forked along with the rest of this file. Simulation mode
+        # still drives the real stimulator controller if one is reachable, which
+        # is exactly why it needs the same validation, ownership and deadline.
+        # The controller URL is server configuration, not a message field
+        # (audit S7).
+        self.stim = StimAuthority(
+            client=StimulationClient(
+                base_url=stim_controller_url) if stim_controller_url else StimulationClient(),
+            broadcast=self.broadcast,
+            max_train_seconds=stim_max_seconds,
+        )
+
+        # Teardown latch (see teardown()).
+        self._torn_down = False
 
         # Ensure output folder exists
         os.makedirs(self.output_folder, exist_ok=True)
@@ -284,6 +299,9 @@ class SimulatedWebSocketServer:
         print(f"Client {client_id} connected. Total clients: {len(self.clients)}")
 
         decomp_status = self.decomp.get_status()
+        # stimulation_active / recording let a reconnecting client rehydrate the
+        # two pieces of state it cannot observe (audit S5/B1); mirrors
+        # RippleWebSocketServer._connected_payload.
         await websocket.send(json.dumps({
             "type": "connected",
             "sample_rate": self.sample_rate,
@@ -294,6 +312,8 @@ class SimulatedWebSocketServer:
             "lsl_enabled": self.enable_lsl,
             "simulated": True,
             "loop_enabled": self.loop,
+            "stimulation_active": self.stim.active,
+            "recording": self.recording.is_recording,
             **decomp_status,
             **self.movement.get_status(),
         }))
@@ -306,9 +326,17 @@ class SimulatedWebSocketServer:
         finally:
             self.clients.discard(websocket)
             print(f"Client {client_id} disconnected. Total clients: {len(self.clients)}")
+            # A departing socket must not leave its train running (audit S2).
+            try:
+                await self.stim.on_client_disconnect(websocket, len(self.clients))
+            except Exception as e:
+                print(f"[SimServer] stim stop-on-disconnect failed: {e}")
 
     async def handle_message(self, message: str, websocket: websockets.WebSocketServerProtocol):
         """Process incoming messages from clients."""
+        # Bound before the try so the catch-all handler below can name the
+        # command even when the failure happened before/at json.loads.
+        command = None
         try:
             data = json.loads(message)
             command = data.get("command")
@@ -436,28 +464,12 @@ class SimulatedWebSocketServer:
                 })
 
             elif command == "stimulate_start":
-                result = await self.stim.start_train(
-                    channels=data.get("channels") or [],
-                    stimulator_type=data.get("stimulator_type"),
-                    port=data.get("port"),
-                    controller_url=data.get("controller_url"),
-                    metadata=data.get("metadata"),
-                )
-                await self.broadcast({
-                    "type": "stimulation_status",
-                    "active": result.get("status") == "success",
-                    **result,
-                })
+                # The authority validates, binds the train to this socket, arms
+                # the deadline and publishes stimulation_status itself.
+                await self.stim.handle_start(data, websocket)
 
             elif command == "stimulate_stop":
-                result = await self.stim.stop(
-                    controller_url=data.get("controller_url"),
-                )
-                await self.broadcast({
-                    "type": "stimulation_status",
-                    "active": False,
-                    **result,
-                })
+                await self.stim.handle_stop(websocket)
 
             elif command == "get_status":
                 decomp_status = self.decomp.get_status()
@@ -465,6 +477,7 @@ class SimulatedWebSocketServer:
                     "type": "status",
                     "connected_to_device": self.device is not None,
                     "recording": self.recording.is_recording,
+                    "stimulation_active": self.stim.active,
                     "buffer_seconds": self.pre_trigger_seconds,
                     "n_clients": len(self.clients),
                     "stream_type": "simulated",
@@ -485,6 +498,22 @@ class SimulatedWebSocketServer:
                 "type": "error",
                 "message": "Invalid JSON message"
             }))
+        except Exception as e:
+            # Audit D3: this used to catch JSONDecodeError only, so any other
+            # exception closed the socket with a 1011. With stop-on-disconnect
+            # wired in, that close would now also stop a legitimate train and
+            # take recording control down with it. Report and stay up.
+            import traceback
+            print(f"[SimServer] Unhandled error while processing command "
+                  f"{command!r}: {e}")
+            traceback.print_exc()
+            try:
+                await websocket.send(json.dumps({
+                    "type": "error",
+                    "message": f"Command '{command}' failed: {e}"
+                }))
+            except Exception:
+                pass    # the socket is already gone; nothing left to report to
 
     @staticmethod
     def _build_movement_timeline(classification_events, sample_rate):
@@ -890,7 +919,13 @@ class SimulatedWebSocketServer:
             await asyncio.sleep(self.chunk_interval_ms / 1000.0)
 
     def shutdown(self):
-        """Clean up resources."""
+        """Synchronous resource release: stop the loops, drop the device and LSL.
+
+        Kept under this name for any caller that cannot await, and reused as the
+        last step of `teardown()`. Not a safe shutdown on its own: a synchronous
+        function structurally cannot await the stimulator stop or the recording
+        flush (audit S2/S8.4).
+        """
         self._running = False
         if self.device is not None:
             del self.device
@@ -898,6 +933,95 @@ class SimulatedWebSocketServer:
         if self.lsl_outlet is not None:
             del self.lsl_outlet
             self.lsl_outlet = None
+
+    async def teardown(self):
+        """Async teardown, awaited from run()'s finally. Idempotent.
+
+        Mirrors RippleWebSocketServer.teardown() minus the steps this fork has
+        no equivalent for (no online-run writer, no movement-recording save
+        path). Order: stimulation off first, then the RAM-only recording, then
+        the exo COM port, then the device.
+        """
+        if self._torn_down:
+            return
+        self._torn_down = True
+        print("\n[Teardown] shutting down...")
+        self._running = False
+
+        try:
+            await self.stim.shutdown()
+        except Exception as e:
+            print(f"[Teardown] stimulation stop FAILED: {e} — check the stimulator")
+
+        await self._flush_recording_for_teardown()
+
+        try:
+            self.decomp.stop_classification()       # closes the exo COM port
+        except Exception as e:
+            print(f"[Teardown] stop_classification failed: {e}")
+
+        try:
+            await asyncio.to_thread(self.shutdown)
+        except Exception as e:
+            print(f"[Teardown] device/LSL cleanup failed: {e}")
+
+        print("[Teardown] done.")
+
+    async def _flush_recording_for_teardown(self):
+        """Save whatever a running recording captured, instead of dropping it.
+
+        Also covers the sim-only path where playback simply ends (audit P5: the
+        sim server used to drop an active recording wordlessly), because that
+        exits stream_data() and lands in run()'s finally.
+        """
+        if not self.recording.is_recording:
+            return
+        print("[Teardown] a recording is still running — flushing it to disk")
+        try:
+            await self.stop_recording(None)
+            return
+        except Exception as e:
+            import traceback
+            print(f"[Teardown] normal recording save FAILED ({e}); "
+                  f"falling back to an emergency dump")
+            traceback.print_exc()
+        try:
+            await asyncio.to_thread(self._emergency_dump_recording)
+        except Exception as e:
+            print(f"[Teardown] EMERGENCY DUMP FAILED: {e} — the recording is lost")
+
+    def _emergency_dump_recording(self):
+        """Last-resort write of an in-progress recording (blocking; use to_thread).
+
+        Chunks are pickled as a LIST, not hstacked: hstack is a plausible cause
+        of the failure that got us here and doubles peak RSS. Reassemble on load
+        with np.hstack([pre_trigger_data] + recorded_chunks).
+        """
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(self.output_folder, f"emg_recording_EMERGENCY_{ts}.pkl")
+        payload = {
+            "kind": "emergency_teardown_dump",
+            "note": "backend shut down mid-recording; chunks are NOT concatenated: "
+                    "np.hstack([pre_trigger_data] + recorded_chunks)",
+            "pre_trigger_data": self.recording.pre_trigger_data,
+            "recorded_chunks": self.recording.recorded_chunks,
+            "srate": self.sample_rate,
+            "n_channels": self.n_channels,
+            "filtered": self.enable_filtering,
+            "pre_trigger_seconds": self.pre_trigger_seconds,
+            "timestamp": ts,
+            "stream_type": "simulated",
+            "trial_metadata": self.recording.metadata,
+        }
+        try:
+            with open(path, "wb") as f:
+                pkl.dump(payload, f)
+        except Exception as e:
+            print(f"[Teardown] emergency dump failed ({e}); retrying without metadata")
+            payload["trial_metadata"] = repr(self.recording.metadata)[:2000]
+            with open(path, "wb") as f:
+                pkl.dump(payload, f)
+        print(f"[Teardown] emergency dump written: {os.path.abspath(path)}")
 
     async def run(self):
         """Start the server and data streaming."""
@@ -909,7 +1033,19 @@ class SimulatedWebSocketServer:
         print("Waiting for frontend connections...")
 
         try:
-            async with serve(self.handle_client, self.host, self.port):
-                await self.stream_data()
+            # ping_interval/ping_timeout are explicit: the websockets defaults
+            # (20/20) mean a hard-crashed tab is not even noticed for up to 40s,
+            # and stop-on-disconnect is only as good as the disconnect detection
+            # (audit S2). 5/5 bounds that at ~10s with a train active.
+            async with serve(self.handle_client, self.host, self.port,
+                             ping_interval=5, ping_timeout=5):
+                try:
+                    await self.stream_data()
+                finally:
+                    # Inside the serve() context, so the final stimulation and
+                    # recording statuses can still reach connected clients.
+                    await self.teardown()
         finally:
-            self.shutdown()
+            # Safety net for a failure before or during bind. teardown() is
+            # latched, so this is a no-op whenever the inner call already ran.
+            await self.teardown()
