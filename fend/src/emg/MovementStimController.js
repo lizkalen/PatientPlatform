@@ -58,7 +58,9 @@ export default class MovementStimController {
 		// -- dead-man watchdog (independent of the decision stream) --
 		this.decisionTimeoutMs = 2000;   // no movement_decision for this long -> force stop
 		this.maxTrainMs = 30000;         // absolute cap on any one train -> force stop
+		this.stopRetryMs = 2000;         // cadence for retrying a stop that failed to send
 		this._lastDecisionAt = 0;
+		this._lastStopAttemptAt = 0;
 		this._wdTimer = null;
 		this._alarmListeners = [];       // operator-visible alarms (wired to the status banner)
 
@@ -173,21 +175,33 @@ export default class MovementStimController {
 	 *
 	 * @param {object} [opts]
 	 * @param {boolean} [opts.force] - send regardless of local belief (emergency stop)
+	 * @param {string} [opts.why] - watchdog cause, kept in the alarm text if the send fails
 	 * @returns {boolean} whether the command left the socket
 	 */
-	stopAll({ force = false } = {}) {
-		this._clearWatchdog();
+	stopAll({ force = false, why = null } = {}) {
 		this._awaitRest = true;   // no restart until p_move is seen back below offThreshold
-		if (!force && !this.stimming && !this._pendingStop) return true;
+		if (!force && !this.stimming && !this._pendingStop) { this._clearWatchdog(); return true; }
+		this._lastStopAttemptAt = this._now();
 		const sent = this.client.stimulateStop({ controllerUrl: this.stimCfg.controllerUrl });
 		if (sent) {
 			// Sent, not yet confirmed: the server's `stimulation_status` is what actually
 			// settles this (see _onStimStatus). Locally we stop driving immediately.
 			this.stimming = false;
 			this._pendingStop = false;
+			this._clearWatchdog();
 		} else {
+			// The train is still presumed running, so the local backstop must NOT be torn
+			// down here — it is the only thing left bounding it. Keep it armed; it retries
+			// the stop on `stopRetryMs` until it lands or the socket returns.
+			const first = !this._pendingStop;
 			this._pendingStop = true;
-			this._raiseAlarm('STOP NOT SENT — no connection to the server; stimulation may still be running');
+			if (!this._wdTimer) this._armWatchdog();
+			// One alarm per failure episode: the retries are silent, and the first
+			// message (with the watchdog cause, if any) stays on the banner.
+			if (first) {
+				this._raiseAlarm((why ? `STIM WATCHDOG (${why}) — ` : '')
+					+ 'STOP NOT SENT — no connection to the server; stimulation may still be running');
+			}
 		}
 		return sent;
 	}
@@ -214,10 +228,28 @@ export default class MovementStimController {
 		if (s.status === 'error') {
 			this.stimming = true;
 			this._pendingStop = false;
+			this._adoptActiveTrain();
 			this._raiseAlarm('STIMULATION STILL ACTIVE — the stop FAILED at the device; the server is retrying');
 		} else if (s.rehydrated) {
 			this.stimming = true;
+			this._adoptActiveTrain();
 		}
+	}
+
+	/**
+	 * A train we now believe is running but did not start ourselves (a stop that failed
+	 * at the device, or one already running when we connected). It gets the same local
+	 * backstop as one we started — without this, a presumed-active train had no timer
+	 * bounding it at all.
+	 *
+	 * The clocks start now because we do not know when the train really began. With no
+	 * decisions flowing the 2 s starvation timeout will force a stop within ~2 s; that
+	 * is the intended direction — a spurious stop is safe, a suppressed one is not.
+	 */
+	_adoptActiveTrain() {
+		this._lastDecisionAt = this._now();
+		this._stimStartedAt = this._now();
+		this._armWatchdog();
 	}
 
 	// -- dead-man watchdog ---------------------------------------------------------
@@ -236,6 +268,13 @@ export default class MovementStimController {
 	_checkWatchdog() {
 		if (!this.stimming) { this._clearWatchdog(); return; }
 		const now = this._now();
+		if (this._pendingStop) {
+			// A stop that failed to send. The alarm is already up and the fault latch (if
+			// any) already set — just keep attempting on a slow cadence so the presumed-
+			// active train is chased down without spamming the socket or the banner.
+			if (now - this._lastStopAttemptAt >= this.stopRetryMs) this.stopAll({ force: true });
+			return;
+		}
 		if (now - this._lastDecisionAt >= this.decisionTimeoutMs) {
 			this._failsafeStop(`no movement decision for ${now - this._lastDecisionAt} ms`);
 		} else if (now - this._stimStartedAt >= this.maxTrainMs) {
@@ -255,6 +294,8 @@ export default class MovementStimController {
 		this.enabled = false;
 		this._raiseAlarm(`STIM WATCHDOG — ${why}. Stop forced and closed-loop stim LATCHED OFF; `
 			+ 'it will not restart until the operator re-arms it.');
-		this.stopAll({ force: true });
+		// `why` rides along so that if the stop cannot be sent, the failure alarm that
+		// replaces this one on the banner still names the cause (banner is last-write-wins).
+		this.stopAll({ force: true, why });
 	}
 }
