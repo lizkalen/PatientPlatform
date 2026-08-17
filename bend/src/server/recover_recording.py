@@ -83,6 +83,13 @@ SPOOL_SUFFIX = ".spool"
 SPOOL_KIND = "emg_recording_spool"
 SPOOL_LAYOUT = ("samples-major: np.fromfile(spool, dtype).reshape(-1, n_channels).T")
 
+# Movement online-run captures: a second raw+sidecar artefact written by the
+# same servers. Not a recording spool - it is never turned into an
+# emg_recording .pkl - but it obeys the same "sidecar at start" rule, and
+# --list reports orphans of both kinds.
+ONLINE_SUFFIX = ".raw"
+ONLINE_KIND = "movement_online"
+
 # Cap on one filename token (subject, session). See safe_name.
 MAX_NAME_TOKEN = 40
 
@@ -97,6 +104,42 @@ LIVE_SPOOL_SETTLE_S = 0.5
 def sidecar_path(spool_path: str) -> str:
     """``<name>.spool`` -> ``<name>.spool.pkl``."""
     return spool_path + ".pkl"
+
+
+def online_sidecar_path(raw_path: str) -> str:
+    """``<name>.raw`` -> ``<name>.pkl`` (the movement online-run convention).
+
+    Deliberately NOT the spool's ``<name>.spool.pkl`` shape: analysis code
+    already loads ``mv_*_online_*.pkl`` beside its ``.raw``, and renaming it to
+    chase consistency would break those loaders to buy nothing. The two formats
+    share their writer helpers and their "sidecar at start" rule, which is what
+    actually matters for recoverability.
+    """
+    return os.path.splitext(raw_path)[0] + ".pkl"
+
+
+def find_online_captures(folder: str) -> list:
+    """Every movement online-run ``.raw`` in a folder, newest first."""
+    if not os.path.isdir(folder):
+        raise NotADirectoryError(folder)
+    found = [os.path.join(folder, n) for n in os.listdir(folder)
+             if n.endswith(ONLINE_SUFFIX)]
+    return sorted(found, key=os.path.getmtime, reverse=True)
+
+
+def read_online_sidecar(raw_path: str) -> dict:
+    """Load and sanity-check the sidecar beside an online-run ``.raw``."""
+    path = online_sidecar_path(raw_path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"no sidecar beside {os.path.basename(raw_path)} (expected "
+            f"{os.path.basename(path)}); the channel count and dtype are "
+            f"unknown, so the file cannot be reshaped")
+    with open(path, "rb") as f:
+        info = pkl.load(f)
+    if not isinstance(info, dict) or info.get("kind") != ONLINE_KIND:
+        raise ValueError(f"{path} is not a movement online-run sidecar")
+    return info
 
 
 def safe_name(s, default: str = "x", max_len: int = MAX_NAME_TOKEN) -> str:
@@ -405,7 +448,7 @@ def _print_listing(folder: str) -> int:
     partials = sorted(n for n in os.listdir(folder) if n.endswith(".partial"))
 
     if not spools:
-        print(f"No orphaned spools in {folder}")
+        print(f"No orphaned recording spools in {folder}")
     else:
         print(f"{len(spools)} spool(s) in {folder}:")
         for path in spools:
@@ -438,6 +481,29 @@ def _print_listing(folder: str) -> int:
             except Exception as exc:                               # noqa: BLE001
                 print(f"  {os.path.basename(path):<58s} UNREADABLE: {exc}")
         print("\nRecover one with:\n  python -m server.recover_recording <spool-file>")
+
+    online = find_online_captures(folder)
+    if online:
+        print(f"\n{len(online)} movement online-run capture(s):")
+        for path in online:
+            try:
+                info = read_online_sidecar(path)
+                n_ch = int(info.get("n_channels") or 0)
+                itemsize = np.dtype(info.get("dtype") or "float32").itemsize
+                on_disk = (os.path.getsize(path) // (n_ch * itemsize)) if n_ch else 0
+                srate = info.get("srate") or 0
+                duration = f"{on_disk / srate:.1f}s" if srate else f"{on_disk} samples"
+                state = "complete" if info.get("complete") else "INTERRUPTED"
+                print(f"  {os.path.basename(path):<58s} {duration:>10s}  {state}")
+                if not info.get("complete"):
+                    print(f"      - the server never closed this run; the sidecar is "
+                          f"the one written at start, so `decisions` is empty and "
+                          f"n_samples reads {info.get('n_samples')} rather than "
+                          f"{on_disk}")
+                print(f"      - load with: np.fromfile(raw, np.{info.get('dtype')})"
+                      f".reshape(-1, {n_ch}).T")
+            except Exception as exc:                                # noqa: BLE001
+                print(f"  {os.path.basename(path):<58s} UNREADABLE: {exc}")
 
     if partials:
         print(f"\n{len(partials)} interrupted write(s) (*.partial) — a save was "
