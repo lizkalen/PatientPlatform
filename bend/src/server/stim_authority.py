@@ -118,6 +118,13 @@ DEFAULT_STOP_RETRY_LIMIT = 15          # 15 x 2 s = 30 s of retries
 SHUTDOWN_STOP_ATTEMPTS = 3
 SHUTDOWN_STOP_INTERVAL_S = 1.0
 
+# Distinct client-supplied controller_url values are remembered so each is
+# warned about once instead of once per command. Capped: a client sending a
+# fresh URL every message would otherwise grow the set without bound, and the
+# warning is a diagnostic, not a security control - the URL is ignored either
+# way, whether or not we bothered to name it.
+MAX_REMEMBERED_REJECTED_URLS = 32
+
 # Reasons carried by `stimulation_status`. Kept here so both servers and any
 # future test agree on the vocabulary.
 REASON_REQUESTED = "requested"
@@ -316,8 +323,11 @@ class StimAuthority:
         self._watchdog_task: Optional[asyncio.Task] = None
         self._retry_task: Optional[asyncio.Task] = None
         # controller_url values a client tried to override, so the warning is
-        # logged once per distinct value instead of once per command.
+        # logged once per distinct value instead of once per command. Bounded by
+        # MAX_REMEMBERED_REJECTED_URLS; _url_cap_logged makes the "no longer
+        # naming them" notice appear exactly once.
         self._rejected_urls = set()
+        self._url_cap_logged = False
 
     # ── state ────────────────────────────────────────────────────────────────
 
@@ -444,14 +454,42 @@ class StimAuthority:
             # safe when we believed nothing was running: if a train IS active,
             # stopping it here would silently end therapy the operator wants.
             print("[StimAuthority] start failed; sending a defensive stop")
-            await self.client.stop()
+            stop_result = await self.client.stop()
+            if stop_result.get("status") != "success":
+                # Both calls failed, so we know nothing about the hardware: the
+                # controller may have armed the channels and then refused to
+                # disarm them. Assume the worse of the two possibilities rather
+                # than report "off" and walk away - an unwatched train we cannot
+                # see is precisely the S6 failure this class exists to prevent.
+                # Same treatment as a failed stop: believe it is running, keep
+                # asking, stay loud.
+                self._active = True
+                # Bind it to the requester so stop-on-disconnect gets a shot at
+                # it too; this socket's command is what may have created it.
+                self._owner = _Ownership(
+                    socket=websocket,
+                    client_id=id(websocket) if websocket is not None else None)
+                message = (f"{message}; the follow-up stop also failed "
+                           f"({stop_result.get('message')}) - a train may be "
+                           f"running and is being retried")
+                print(f"[StimAuthority] *** START FAILED AND THE DEFENSIVE STOP "
+                      f"ALSO FAILED: {message} — assuming a train is ACTIVE; "
+                      f"retrying every {self.stop_retry_interval_s:g}s ***")
+                # Reason stays "requested": this is the outcome of a client
+                # command, and the reason vocabulary is a fixed frontend
+                # contract - a new value would be dropped by the UI.
+                self._schedule_retry(REASON_REQUESTED)
         else:
             print("[StimAuthority] start failed while a train was already active; "
                   "the previous train is left running and its deadline stands")
 
         # No watchdog re-arm on failure: if a train was already running, its
-        # original deadline is still the one that must fire.
-        msg = self.status_message(was_active, "error", REASON_REQUESTED, message)
+        # original deadline is still the one that must fire, and a train we only
+        # SUSPECT exists is chased by the retry loop, not by a deadline.
+        # `self._active`, not `was_active`: the branch above may have just
+        # changed our belief, and reporting the stale one would re-create the
+        # exact "failed stop broadcast as off" bug (audit S6).
+        msg = self.status_message(self._active, "error", REASON_REQUESTED, message)
         await self._publish(msg)
         return msg
 
@@ -459,10 +497,12 @@ class StimAuthority:
         """Handle a `stimulate_stop` command. Returns the status message sent.
 
         Ownership is NOT enforced on stop: any client must be able to stop any
-        train. An emergency stop that checks credentials first is not one.
+        train. An emergency stop that checks credentials first is not one, and
+        for the same reason it is `force`d through to the hardware even when we
+        believe nothing is running.
         """
         async with self._lock:
-            return await self._stop_locked(REASON_REQUESTED)
+            return await self._stop_locked(REASON_REQUESTED, force=True)
 
     # ── autonomous stops ─────────────────────────────────────────────────────
 
@@ -472,21 +512,32 @@ class StimAuthority:
         Stops the train when the departing socket owns it, and also when the
         last client leaves regardless of ownership - with nobody connected there
         is no one left who could ever send `stimulate_stop` (audit S2).
-        """
-        owns = self._owner.socket is websocket
-        if not self._active:
-            if owns:
-                self._owner = _Ownership()
-            return None
-        if not owns and remaining_clients > 0:
-            return None
 
-        why = ("the commanding client disconnected" if owns
-               else "the last client disconnected")
-        print(f"[StimAuthority] stopping stimulation: {why}")
+        The WHOLE decision is taken inside the lock, against ownership as it is
+        at that moment. Reading `_owner` before acquiring is a real race: client
+        B's `stimulate_start` can be holding the lock across its HTTP PUT while
+        A's disconnect waits behind it, and a stale `owns=True` snapshot would
+        then stop B's brand-new train under A's name - silently ending another
+        client's therapy and mislabelling the broadcast reason.
+
+        `remaining_clients` is inherently a snapshot (the authority cannot see
+        the server's client set), but it can only go stale in the safe
+        direction: it was taken after this socket was discarded, so a client
+        that connects in the meantime makes us stop when we need not have,
+        never the reverse.
+        """
         async with self._lock:
+            owns = self._owner.socket is websocket
             if not self._active:
+                if owns:
+                    self._owner = _Ownership()
                 return None
+            if not owns and remaining_clients > 0:
+                return None
+
+            why = ("the commanding client disconnected" if owns
+                   else "the last client disconnected")
+            print(f"[StimAuthority] stopping stimulation: {why}")
             return await self._stop_locked(REASON_CLIENT_DISCONNECT)
 
     async def on_device_lost(self) -> Optional[dict]:
@@ -527,12 +578,8 @@ class StimAuthority:
             for attempt in range(1, SHUTDOWN_STOP_ATTEMPTS + 1):
                 result = await self.client.stop()
                 if result.get("status") == "success":
-                    self._active = False
-                    self._owner = _Ownership()
-                    print("[StimAuthority] stimulation stopped for shutdown")
-                    msg = self.status_message(False, "ok", REASON_SHUTDOWN)
-                    await self._publish(msg)
-                    return msg
+                    # Same shared bookkeeping as every other stop path.
+                    return await self._record_stop_success(REASON_SHUTDOWN)
                 print(f"[StimAuthority] shutdown stop attempt {attempt}/"
                       f"{SHUTDOWN_STOP_ATTEMPTS} failed: {result.get('message')}")
                 if attempt < SHUTDOWN_STOP_ATTEMPTS:
@@ -552,22 +599,56 @@ class StimAuthority:
 
     # ── the one stop path ────────────────────────────────────────────────────
 
-    async def _stop_locked(self, reason: str) -> dict:
-        """Issue the stop and update state. Caller holds `self._lock`."""
+    async def _record_stop_success(self, reason: str,
+                                   note: Optional[str] = None) -> dict:
+        """Bookkeeping for a DELETE that landed. Caller holds `self._lock`.
+
+        The ONE place stop-success state is written, so the command path, the
+        retry loop and the shutdown path cannot drift apart. Both cancellations
+        here are re-entrant by design: `_disarm_watchdog` is called from the
+        watchdog's own fire path and `_cancel_retry` from inside the retry loop,
+        which is exactly what their `is current_task()` guards are for.
+        """
+        self._active = False
+        self._owner = _Ownership()
+        self._disarm_watchdog()
+        self._cancel_retry()
+        print(f"[StimAuthority] stimulation stopped (reason={reason})"
+              + (f": {note}" if note else ""))
+        msg = self.status_message(False, "ok", reason, note)
+        await self._publish(msg)
+        return msg
+
+    async def _stop_locked(self, reason: str, force: bool = False) -> dict:
+        """Issue the stop and update state. Caller holds `self._lock`.
+
+        `force` is set by the operator-facing `stimulate_stop` command only. An
+        emergency stop must reach the hardware even when we believe nothing is
+        running, because that belief can be wrong - a second backend instance
+        against the same controller is reachable (audit S7), and the DELETE is
+        idempotent and free. Autonomous stops (watchdog, disconnect, device
+        loss) short-circuit instead: when two of them race for this lock, the
+        loser must not fire a redundant DELETE and, far worse, publish a second
+        differently-reasoned "stopped" that overwrites the true one.
+
+        Either way, a call that does not change our belief publishes nothing. It
+        still returns a well-formed idempotent ack, which is safe to unicast.
+        """
+        if not self._active and not force:
+            return self.status_message(False, "ok", reason)
+
+        was_active = self._active
         self._disarm_watchdog()
         self._cancel_retry()
 
         result = await self.client.stop()
         if result.get("status") == "success":
-            self._active = False
-            self._owner = _Ownership()
-            print(f"[StimAuthority] stimulation stopped (reason={reason})")
-            msg = self.status_message(False, "ok", reason)
-            await self._publish(msg)
-            return msg
+            if not was_active:
+                return self.status_message(False, "ok", reason)
+            return await self._record_stop_success(reason)
 
         message = result.get("message") or "could not stop stimulation"
-        if self._active:
+        if was_active:
             # We asked and it did not land, so the train is still running as far
             # as we know. Say so (audit S6: this used to be broadcast as
             # "active": false) and keep asking.
@@ -576,9 +657,10 @@ class StimAuthority:
                   f"{self.stop_retry_interval_s:g}s ***")
             self._schedule_retry(reason)
         else:
-            # Nothing was running; a failed no-op DELETE must not invent a train
-            # or start a retry storm. Still reported as an error - the
-            # controller is unreachable and the operator should know.
+            # A forced stop while idle: nothing was running, so a failed no-op
+            # DELETE must not invent a train or start a retry storm. Still
+            # reported - the controller is unreachable and the operator, who
+            # just pressed stop, should know that.
             print(f"[StimAuthority] stop failed while idle (reason={reason}): {message}")
 
         msg = self.status_message(self._active, "error", reason, message)
@@ -619,14 +701,10 @@ class StimAuthority:
                       f"(reason={reason})")
                 result = await self.client.stop()
                 if result.get("status") == "success":
-                    self._active = False
-                    self._owner = _Ownership()
-                    self._disarm_watchdog()
-                    print(f"[StimAuthority] stimulation stopped on retry {attempt} "
-                          f"(reason={reason})")
-                    await self._publish(self.status_message(
-                        False, "ok", reason,
-                        f"stopped after {attempt} retry attempt(s)"))
+                    # Shared bookkeeping: this loop must not keep its own copy
+                    # of "what stopping means" and drift from the command path.
+                    await self._record_stop_success(
+                        reason, f"stopped after {attempt} retry attempt(s)")
                     return
                 print(f"[StimAuthority] stop retry {attempt} failed: "
                       f"{result.get('message')}")
@@ -679,6 +757,16 @@ class StimAuthority:
         It is now configuration (`--stim-controller-url`), not a message field.
         """
         if not url or url in self._rejected_urls:
+            return
+        if len(self._rejected_urls) >= MAX_REMEMBERED_REJECTED_URLS:
+            # Stop growing the set. The URL is still ignored - only the
+            # per-value diagnostic stops, and only after saying so once.
+            if not self._url_cap_logged:
+                self._url_cap_logged = True
+                print(f"[StimAuthority] more than {MAX_REMEMBERED_REJECTED_URLS} "
+                      f"distinct client-supplied controller_url values seen; "
+                      f"further ones are still ignored but will no longer be "
+                      f"reported individually")
             return
         self._rejected_urls.add(url)
         if url.rstrip("/") != self.client.base_url:
