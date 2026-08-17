@@ -1009,6 +1009,22 @@ export default class EMGClient {
 	}
 
 	_notifyDisconnect() {
+		// `isRecording` is otherwise only ever assigned from a server message, so a drop
+		// left it true forever: the UI went on asserting that data was being captured
+		// while nothing was connected (audit B1). Clear it and fan the change out, so the
+		// pulsing RECORDING indicator stops. This is a statement about THIS CLIENT, not
+		// about the server — the server finalizes the partial block on its side, and the
+		// connect payload restores the truth if it is still recording when we return.
+		//
+		// Deliberately NOT done for stimulation: a dropped socket is no evidence that a
+		// train stopped, which is the whole point of the pending-stop latch (audit S5).
+		if (this.isRecording) {
+			this._handleRecordingStatus({
+				recording: false,
+				message: 'Connection lost — recording state unknown until reconnect',
+			});
+		}
+
 		for (const cb of this.onDisconnectCallbacks) {
 			cb();
 		}
