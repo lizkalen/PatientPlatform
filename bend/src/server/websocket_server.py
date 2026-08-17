@@ -643,6 +643,12 @@ class RippleWebSocketServer:
                 "type": "error",
                 "message": "Invalid JSON message"
             }))
+        except websockets.exceptions.ConnectionClosed:
+            # Not a command failure: the socket dropped mid-command. Must be
+            # re-raised so handle_client's dedicated handler sees it, rather
+            # than logged as an alarming traceback and answered down a socket
+            # that is already gone.
+            raise
         except Exception as e:
             # Audit D3: this used to catch JSONDecodeError only, so any other
             # exception (int() on a non-numeric channel, a ragged hstack, a
