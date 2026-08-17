@@ -20,6 +20,7 @@ They are a substitute for the packages, not a simplification of the tests.
 """
 
 import asyncio
+import importlib
 import os
 import sys
 import traceback
@@ -37,24 +38,57 @@ CHECKS = []
 # ── path + import plumbing ───────────────────────────────────────────────────
 
 def ensure_src_on_path():
-    """Make `server.*` importable. Normal import first, then bend/src."""
+    """Make THIS checkout's `server.*` importable.
+
+    Plain import first, as mvdecoder's tests do, then fall back to bend/src.
+    There is a third case worth handling explicitly: the environment may carry
+    an editable install pointing at a *different* clone (the `patientgui` env on
+    the dev machine resolves `server` to a sibling PatientGUI checkout), and
+    that copy does not contain the modules under test. So the resolved package
+    is checked against this repo, and a foreign one is evicted.
+    """
     try:
-        import server  # noqa: F401
-    except ImportError:
-        sys.path.insert(0, SRC)       # no editable install: import from source
+        import server
+        resolved = os.path.dirname(os.path.abspath(list(server.__path__)[0]))
+        if os.path.normcase(resolved) == os.path.normcase(SRC):
+            return
+        for name in [n for n in list(sys.modules)
+                     if n == "server" or n.startswith("server.")]:
+            del sys.modules[name]
+    except Exception:                                             # noqa: BLE001
+        pass
+    if SRC in sys.path:
+        sys.path.remove(SRC)
+    sys.path.insert(0, SRC)           # ahead of any installed copy
+
+
+def _is_importable(name):
+    """True when the real package is installed and imports cleanly."""
+    try:
+        importlib.import_module(name)
+        return True
+    except Exception:                                             # noqa: BLE001
+        return False
 
 
 class _StubbedModules:
     """Install stub modules for the duration of a block, then restore.
 
-    Restoring matters: these tests may run inside a session with other tests
-    that need the real numpy/websockets. Modules imported *inside* the block
-    keep working afterwards because they captured the stub objects as their own
-    globals at import time.
+    Only for what is genuinely missing. On the `patientgui` conda environment
+    numpy, scipy, pylsl and websockets are all present, and the tests should
+    exercise the code against the real thing - a stubbed numpy would make the
+    recording round-trip tests meaningless. On a bare Python the stubs step in
+    so the suite still runs at all.
+
+    Restoring matters either way: these tests may run inside a session with
+    other tests that need the real packages. Modules imported *inside* the
+    block keep working afterwards because they captured whatever objects were
+    in place as their own globals at import time.
     """
 
     def __init__(self, modules):
-        self._modules = modules
+        self._modules = {name: mod for name, mod in modules.items()
+                         if not _is_importable(name)}
         self._saved = {}
 
     def __enter__(self):
@@ -181,14 +215,37 @@ def import_authority():
 
 
 def import_servers():
-    """Import both WebSocket server modules with the full stub set."""
+    """Import both WebSocket server modules, stubbing whatever is missing.
+
+    Returns ``(RippleWebSocketServer, SimulatedWebSocketServer,
+    ConnectionClosed)`` - the exception class is returned because it must be
+    the one the server modules actually see. With real `websockets` installed
+    that is the genuine class (which the servers' `except` clause matches);
+    with the stub it is `StubConnectionClosed`. A test that constructs the
+    wrong one would silently exercise the catch-all instead.
+    """
     ensure_src_on_path()
     stubs = _http_stubs()
     stubs.update(_server_stubs())
     with _StubbedModules(stubs):
         from server.websocket_server import RippleWebSocketServer
         from server.simulated_websocket_server import SimulatedWebSocketServer
-    return RippleWebSocketServer, SimulatedWebSocketServer
+        import websockets
+        connection_closed = websockets.exceptions.ConnectionClosed
+    return RippleWebSocketServer, SimulatedWebSocketServer, connection_closed
+
+
+def make_connection_closed(cls):
+    """Instantiate a ConnectionClosed, real or stubbed.
+
+    The real one takes the received/sent close frames; the stub takes a message.
+    """
+    if cls is StubConnectionClosed:
+        return cls("peer went away")
+    try:
+        return cls(None, None)
+    except TypeError:
+        return cls(None, None, None)
 
 
 # ── fakes ────────────────────────────────────────────────────────────────────

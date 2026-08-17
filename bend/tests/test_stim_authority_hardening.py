@@ -40,8 +40,8 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 from _stim_stubs import (                                       # noqa: E402
-    FakeClient, Recorder, Sock, StubConnectionClosed, arun, import_authority,
-    import_servers, ok, run_suite, start_request,
+    FakeClient, Recorder, Sock, arun, import_authority, import_servers,
+    make_connection_closed, ok, run_suite, start_request,
 )
 
 sa = import_authority()
@@ -320,10 +320,10 @@ def test_connection_closed_propagates_out_of_handle_message():
     traceback, a reply written to a socket that is gone, and - worse - the
     dedicated disconnect path (which now stops stimulation) never sees it.
     """
-    ok(issubclass(StubConnectionClosed, Exception),
-       "ConnectionClosed is a plain Exception, so clause order matters")
+    RippleWebSocketServer, SimulatedWebSocketServer, ConnectionClosed = import_servers()
 
-    RippleWebSocketServer, SimulatedWebSocketServer = import_servers()
+    ok(issubclass(ConnectionClosed, Exception),
+       "ConnectionClosed is a plain Exception, so clause order matters")
 
     async def scenario(output):
         for label, cls, kwargs in [
@@ -335,11 +335,11 @@ def test_connection_closed_propagates_out_of_handle_message():
             server = cls(output_folder=output, **kwargs)
 
             dropped = Sock("dropped")
-            dropped.raise_on_send = StubConnectionClosed("peer went away")
+            dropped.raise_on_send = make_connection_closed(ConnectionClosed)
             raised = None
             try:
                 await server.handle_message('{"command": "get_status"}', dropped)
-            except StubConnectionClosed:
+            except ConnectionClosed:
                 raised = "ConnectionClosed"
             except Exception as exc:                              # noqa: BLE001
                 raised = type(exc).__name__
