@@ -1,0 +1,109 @@
+/**
+ * Status Banner
+ * =============
+ *
+ * Fixed top-centre alarm/connection strip, mounted once by App.js and visible in
+ * BOTH modes (patient mode hides `.timeline` and `.tp-dfwv`; nothing here matches
+ * those selectors, and the element is a direct child of <body>, outside the
+ * `#app` width/margin shift).
+ *
+ * Above every other layer: EMG modal / config panel 1000, mode menu 960,
+ * tutorial 600, session panel 550. A stim alarm must never be behind a dialog.
+ */
+
+$sidebar-width: 280px;
+
+.status-banner {
+	display: none;                 // no modifier = nothing to report
+	position: fixed;
+	top: 14px;
+	left: 50%;
+	transform: translateX(-50%);
+	z-index: 2000;
+	align-items: center;
+	gap: 10px;
+	max-width: min(760px, 92vw);
+	box-sizing: border-box;
+	padding: 10px 14px;
+	border-radius: 10px;
+	border: 1px solid rgba(255, 255, 255, 0.14);
+	background: rgba(16, 19, 26, 0.94);
+	backdrop-filter: blur(8px);
+	box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+	color: #eef1f6;
+	font: 600 13px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+	letter-spacing: 0.02em;
+	text-align: left;
+
+	&--alarm,
+	&--warn {
+		display: flex;
+	}
+
+	// Stimulation alarm — the one state that means "current may be flowing".
+	&--alarm {
+		background: #8c1d1d;
+		border-color: #ff6b6b;
+		color: #fff;
+		box-shadow: 0 8px 28px rgba(140, 29, 29, 0.55);
+	}
+
+	// Connection / device loss.
+	&--warn {
+		background: rgba(50, 38, 12, 0.96);
+		border-color: rgba(240, 168, 56, 0.6);
+		color: #f7d9a0;
+	}
+
+	&__dot {
+		flex: 0 0 auto;
+		width: 9px;
+		height: 9px;
+		border-radius: 50%;
+		background: currentColor;
+
+		.status-banner--alarm & {
+			animation: status-banner-pulse 1s ease-in-out infinite;
+		}
+	}
+
+	&__text {
+		flex: 1 1 auto;
+	}
+
+	&__dismiss {
+		flex: 0 0 auto;
+		padding: 2px 6px;
+		border: 1px solid rgba(255, 255, 255, 0.35);
+		border-radius: 6px;
+		background: transparent;
+		color: inherit;
+		font: inherit;
+		line-height: 1;
+		cursor: pointer;
+
+		&:hover {
+			background: rgba(255, 255, 255, 0.15);
+		}
+
+		&[hidden] {
+			display: none;
+		}
+	}
+}
+
+@keyframes status-banner-pulse {
+	50% { opacity: 0.35; }
+}
+
+// Patient mode: re-centre over the visible viewport (the progress sidebar takes the
+// right-hand 280px). Positioning lives entirely in CSS — no inline `left` to beat.
+body.patient-mode .status-banner {
+	left: calc((100% - #{$sidebar-width}) / 2);
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.status-banner__dot {
+		animation: none !important;
+	}
+}

@@ -21,6 +21,7 @@ import PatientModeController from './ui/PatientModeController';
 import ModeMenu from './ui/ModeMenu';
 import ProgressSidebar from './ui/ProgressSidebar';
 import TutorialOverlay from './ui/TutorialOverlay';
+import StatusBanner from './ui/StatusBanner';
 
 export default class App {
 
@@ -77,6 +78,10 @@ export default class App {
 				nostimTrigger: sequenceConfig.stimulation?.nostimTrigger || null,
 			},
 		);
+		// The sensor pass drives the stimulator directly through the client, so its own
+		// failsafes report to the banner too (the closed-loop ones are wired in initEMG).
+		this.movementSession.onAlarm((message) => this.statusBanner.raiseAlarm(message));
+
 		this.movementSessionView = new MovementSessionView(this.movementSession);
 
 		// Single mode dropdown (Config / Patient / Movement Session) — replaces the
@@ -116,14 +121,21 @@ export default class App {
 			autoReconnect: true,
 		});
 
+		// Connection + stimulation banner. Mounted on <body>, so it is the one status
+		// indicator visible in patient mode as well as config mode. Created before
+		// connect() so it sees the very first connect/disconnect.
+		this.statusBanner = new StatusBanner(this.emgClient);
+
 		// Initialize EMG channel visualization
 		this.emgChannelView = new EMGChannelView(this.emgClient);
 
 		// Initialize decomposition sidebar (needs emgClient; controller created after webgl)
 		this.decompositionView = new DecompositionView(this.emgClient);
 
-		// Closed-loop stim (recognized movement -> its FES pattern) for the online phase
+		// Closed-loop stim (recognized movement -> its FES pattern) for the online phase.
+		// Its failsafes (stop not sent, dead-man watchdog) surface on the banner.
 		this.movementStim = new MovementStimController(this.emgClient);
+		this.movementStim.onAlarm((message) => this.statusBanner.raiseAlarm(message));
 
 		// Live trigger waveform (for verifying the stim-trigger channel during setup)
 		this.triggerMonitor = new TriggerMonitor(this.emgClient);
