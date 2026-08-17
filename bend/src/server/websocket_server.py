@@ -53,9 +53,9 @@ from server.movement_training import MovementTrainer, trigger_bouts, estimate_tr
 from server.stimulation_client import StimulationClient
 from server.stim_authority import StimAuthority, DEFAULT_MAX_TRAIN_SECONDS
 from server.recover_recording import (
-    SPOOL_KIND, SPOOL_LAYOUT, SPOOL_SUFFIX, build_recording_payload, load_spool,
-    safe_name, segment_paths, sidecar_path, unique_path, write_pickle_atomic,
-    write_sidecar,
+    ONLINE_KIND, SPOOL_KIND, SPOOL_LAYOUT, SPOOL_SUFFIX, build_recording_payload,
+    load_spool, online_sidecar_path, safe_name, segment_paths, sidecar_path,
+    unique_path, write_pickle_atomic, write_sidecar,
 )
 
 
@@ -225,6 +225,15 @@ class RippleWebSocketServer:
         # trains on raw, so we accumulate raw_samples, not the filtered ones) and
         # the trainer that holds the base model between train and calibrate.
         self.mv_trainer: MovementTrainer = None
+        # ACCEPTED RESIDUAL: unlike the main recording (which spools to disk per
+        # chunk, see RecordingState), _mv_raw is plain RAM between chunks. It is
+        # now saved on every ORDERLY end - mv_record_stop, last-client
+        # disconnect and shutdown all route through _finalize_mv_captures - but
+        # a hard process kill mid-training-block still loses it, and it still
+        # grows with block length. Closing that gap means giving the movement
+        # capture its own spool; the helpers to do it already exist
+        # (_open_spool/_spool_write/_close_spool + server/recover_recording.py),
+        # so it is a contained follow-up rather than new machinery.
         self._mv_raw = []
         self._mv_capturing = False
         self._mv_paused = False           # capture paused (tutorial phase) — excluded from data
@@ -459,13 +468,26 @@ class RippleWebSocketServer:
             # A recording nobody is connected to can never be stopped by anyone,
             # and used to just keep growing (audit P5). The samples are already
             # spooled, so finalising here only costs the reassembly.
-            if not self.clients and self.recording.is_recording:
-                print("[Server] last client disconnected while recording — "
-                      "finalising the recording")
-                try:
-                    await self.stop_recording(None)
-                except Exception as e:
-                    print(f"[Server] finalise on last disconnect failed: {e}")
+            if not self.clients:
+                if self.recording.is_recording:
+                    print("[Server] last client disconnected while recording — "
+                          "finalising the recording")
+                    try:
+                        await self.stop_recording(None)
+                    except Exception as e:
+                        print(f"[Server] finalise on last disconnect failed: {e}")
+                # Same reasoning for the movement captures: with nobody
+                # connected, no mv_record_stop or mv_online_stop can ever
+                # arrive, so an unsaved training block would live only as long
+                # as the process and an online run would keep its start-time
+                # sidecar forever.
+                if self._mv_raw or self._mv_online_file is not None:
+                    print("[Server] last client disconnected mid-movement-capture "
+                          "— saving it as interrupted")
+                    try:
+                        await self._finalize_mv_captures("client_disconnect")
+                    except Exception as e:
+                        print(f"[Server] mv finalise on last disconnect failed: {e}")
 
     async def handle_message(self, message: str, websocket: websockets.WebSocketServerProtocol):
         """Process incoming messages from clients."""
@@ -961,10 +983,17 @@ class RippleWebSocketServer:
             class_order = list(meta.get("class_order", []))
             class_seq = list(meta.get("class_sequence", []))
             trig_ch = int(meta.get("trig_ch", 192))
-            base = f"mv_{session}_{label}_{ts}"
+            # A block the operator never ended (disconnect, shutdown) is marked
+            # in BOTH the filename and the file, so neither a human browsing the
+            # folder nor training code reading the pickle can mistake it for a
+            # complete one. Its class_sequence will not line up with its bouts.
+            interrupted = bool(meta.get("interrupted"))
+            base = f"mv_{session}_{label}_{ts}" + ("_interrupted" if interrupted else "")
             common = dict(srate=self.sample_rate, n_channels=self.n_channels, filtered=False,
                           timestamp=ts, label=label, class_order=class_order,
                           class_sequence=class_seq, trig_ch=trig_ch,
+                          interrupted=interrupted,
+                          interrupted_reason=meta.get("interrupted_reason"),
                           grids=meta.get("grids"), metadata=meta)
             block_path = os.path.join(self.output_folder, base + ".pkl")
             with open(block_path, "wb") as f:
@@ -1003,13 +1032,17 @@ class RippleWebSocketServer:
     def _open_online_writer(self, meta):
         """Open an incremental binary writer for the online run, so the raw stream goes
         straight to disk (samples-major float32) instead of growing in RAM. The chunks
-        are written in the loop; a small metadata sidecar is written at stop. Never raises."""
-        if self._mv_online_file is not None:            # a run was left open — close it
-            try:
-                self._mv_online_file.close()
-            except Exception:
-                pass
-            self._mv_online_file = None
+        are written in the loop. Never raises.
+
+        The sidecar is written HERE, at start, for the same reason the recording
+        spool's is (audit P5): a run orphaned by a disconnect or a crash carries
+        no shape/dtype anywhere else, and without it the .raw is a nameless pile
+        of bytes. It is refreshed at close with the final counts."""
+        if self._mv_online_file is not None:
+            # A run was left open. Close it PROPERLY - sidecar and all - rather
+            # than dropping the handle, which is how a double mv_online_start
+            # used to manufacture an uninterpretable orphan.
+            self._close_online_writer(self._mv_online_dec, self._mv_online_meta)
         try:
             meta = meta or {}
             session = self._safe_name(meta.get("session") or meta.get("sessionId") or "session")
@@ -1017,6 +1050,8 @@ class RippleWebSocketServer:
             self._mv_online_path = os.path.join(self.output_folder, f"mv_{session}_online_{ts}.raw")
             self._mv_online_file = open(self._mv_online_path, "wb", buffering=1 << 20)  # 1 MB buffer
             self._mv_online_nsamp = 0
+            write_pickle_atomic(self._online_sidecar_info([], meta, complete=False),
+                                online_sidecar_path(self._mv_online_path))
             print(f"[MovementSave] online run -> streaming to "
                   f"{os.path.basename(self._mv_online_path)} (incremental)")
             return True
@@ -1025,33 +1060,56 @@ class RippleWebSocketServer:
             self._mv_online_file = self._mv_online_path = None
             return False
 
+    def _online_sidecar_info(self, decisions, meta, complete: bool) -> dict:
+        """Everything needed to interpret an online-run .raw, plus its metadata.
+
+        `complete` is False in the copy written at start: it distinguishes a run
+        that ended properly from one whose server went away mid-capture, where
+        `n_samples` is whatever the file happens to hold rather than a count the
+        writer confirmed.
+        """
+        meta = meta or {}
+        nsamp = int(self._mv_online_nsamp)
+        return dict(
+            kind=ONLINE_KIND,
+            raw_file=os.path.basename(self._mv_online_path or ""),
+            shape=[int(self.n_channels or 0), nsamp],
+            n_channels=int(self.n_channels or 0),
+            n_samples=nsamp,
+            dtype="float32",
+            layout="samples-major: np.fromfile(raw, float32).reshape(-1, n_channels).T",
+            srate=self.sample_rate, filtered=False, complete=bool(complete),
+            class_order=list(meta.get("class_order", [])),
+            model_path=self.movement.model_path, decisions=decisions,
+            metadata=meta)
+
     def _close_online_writer(self, decisions, meta):
-        """Close the incremental raw file and write the (small) metadata sidecar with the
-        shape/dtype needed to load it: np.fromfile(raw, float32).reshape(-1, n_ch).T."""
-        f, path, nsamp = self._mv_online_file, self._mv_online_path, self._mv_online_nsamp
-        self._mv_online_file = self._mv_online_path = None
-        self._mv_online_nsamp = 0
+        """Close the incremental raw file and refresh its metadata sidecar.
+
+        The sidecar already exists (written at start); this rewrites it with the
+        final sample count and decision stream and marks the run complete.
+        """
+        f, path = self._mv_online_file, self._mv_online_path
+        nsamp = self._mv_online_nsamp
         if f is None:
+            self._mv_online_path = None
+            self._mv_online_nsamp = 0
             return None
         try:
             f.close()
-            meta = meta or {}
-            side = os.path.splitext(path)[0] + ".pkl"
-            with open(side, "wb") as sf:
-                pkl.dump(dict(kind="movement_online", raw_file=os.path.basename(path),
-                              shape=[int(self.n_channels or 0), int(nsamp)], dtype="float32",
-                              layout="samples-major: np.fromfile(raw, float32).reshape(-1, n_channels).T",
-                              srate=self.sample_rate, filtered=False,
-                              class_order=list(meta.get("class_order", [])),
-                              model_path=self.movement.model_path, decisions=decisions,
-                              metadata=meta), sf)
+            write_pickle_atomic(self._online_sidecar_info(decisions or [], meta,
+                                                          complete=True),
+                                online_sidecar_path(path))
             dur = nsamp / self.sample_rate if self.sample_rate else 0
             print(f"[MovementSave] online run saved: {os.path.basename(path)} + sidecar "
-                  f"({dur:.1f}s, {len(decisions)} decisions)")
+                  f"({dur:.1f}s, {len(decisions or [])} decisions)")
             return path
         except Exception as e:
             print(f"[MovementSave] failed to finalize online run: {e}")
             return None
+        finally:
+            self._mv_online_file = self._mv_online_path = None
+            self._mv_online_nsamp = 0
 
     # ── recording spool (audit P5) ───────────────────────────────────────────
 
@@ -1841,24 +1899,7 @@ class RippleWebSocketServer:
 
         await self._flush_recording_for_teardown()
 
-        if self._mv_online_file is not None:
-            self._mv_online_capturing = False
-            try:
-                self._close_online_writer(self._mv_online_dec, self._mv_online_meta)
-            except Exception as e:
-                print(f"[Teardown] closing the online writer failed: {e}")
-            self._mv_online_dec = []
-
-        if self._mv_raw:
-            print(f"[Teardown] saving in-progress movement capture "
-                  f"({len(self._mv_raw)} chunks)")
-            try:
-                raw = np.hstack(self._mv_raw)
-                self._mv_capturing = False
-                self._mv_raw = []
-                await asyncio.to_thread(self._save_mv_recording, raw, self._mv_meta)
-            except Exception as e:
-                print(f"[Teardown] movement capture save failed: {e}")
+        await self._finalize_mv_captures("shutdown")
 
         try:
             self.decomp.stop_classification()       # closes the exo COM port
@@ -1873,6 +1914,46 @@ class RippleWebSocketServer:
             print(f"[Teardown] device/LSL cleanup failed: {e}")
 
         print("[Teardown] done.")
+
+    async def _finalize_mv_captures(self, reason: str):
+        """Persist any in-progress movement capture and close the online writer.
+
+        Shared by process teardown and the last-client disconnect, because both
+        are "nobody is going to send mv_record_stop" and the two must not drift.
+
+        The saved training block is marked interrupted twice over - an
+        `_interrupted` token in the filename and `interrupted: True` in the file
+        - so training code cannot ingest a half-block as if the operator had
+        ended it. Capture state is cleared afterwards either way, so a client
+        that reconnects can start a fresh capture instead of being refused by
+        the "already in progress" guard.
+        """
+        if self._mv_online_file is not None:
+            self._mv_online_capturing = False
+            try:
+                self._close_online_writer(self._mv_online_dec, self._mv_online_meta)
+            except Exception as e:
+                print(f"[MovementSave] closing the online writer failed: {e}")
+            self._mv_online_dec = []
+            self._mv_online_meta = None
+
+        if self._mv_raw:
+            print(f"[MovementSave] saving interrupted movement capture "
+                  f"({len(self._mv_raw)} chunks, reason={reason})")
+            try:
+                raw = np.hstack(self._mv_raw)
+                meta = dict(self._mv_meta or {})
+                meta["interrupted"] = True
+                meta["interrupted_reason"] = reason
+                self._mv_raw = []
+                await asyncio.to_thread(self._save_mv_recording, raw, meta)
+            except Exception as e:
+                print(f"[MovementSave] interrupted capture save FAILED: {e}")
+
+        self._mv_capturing = False
+        self._mv_paused = False
+        self._mv_raw = []
+        self._mv_meta = None
 
     async def _flush_recording_for_teardown(self):
         """Finalise a running recording instead of dropping it.

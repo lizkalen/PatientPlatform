@@ -360,13 +360,24 @@ class SimulatedWebSocketServer:
             # A recording nobody is connected to can never be stopped by anyone
             # (audit P5). The samples are already spooled, so finalising here
             # only costs the reassembly.
-            if not self.clients and self.recording.is_recording:
-                print("[SimServer] last client disconnected while recording — "
-                      "finalising the recording")
-                try:
-                    await self.stop_recording(None)
-                except Exception as e:
-                    print(f"[SimServer] finalise on last disconnect failed: {e}")
+            if not self.clients:
+                if self.recording.is_recording:
+                    print("[SimServer] last client disconnected while recording — "
+                          "finalising the recording")
+                    try:
+                        await self.stop_recording(None)
+                    except Exception as e:
+                        print(f"[SimServer] finalise on last disconnect failed: {e}")
+                # This fork has no _save_mv_recording and no online writer, so
+                # there is nothing to persist - only capture state to clear, so
+                # a reconnecting client is not refused by the "already in
+                # progress" guard. (The live server saves the block; playback
+                # captures are reproducible by replaying the same .npz.)
+                if self._mv_raw or self._mv_capturing:
+                    print("[SimServer] last client disconnected mid-movement-capture "
+                          "— discarding it (playback data is reproducible)")
+                    self._mv_capturing = False
+                    self._mv_raw = []
 
     async def handle_message(self, message: str, websocket: websockets.WebSocketServerProtocol):
         """Process incoming messages from clients."""
