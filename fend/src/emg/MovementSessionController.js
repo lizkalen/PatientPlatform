@@ -111,6 +111,7 @@ export default class MovementSessionController {
 		// simply advancing to the next MOVE phase (fend plan A1).
 		this._halted = false;
 		this._haltedFrom = null;                    // state at halt time (reset() closes its capture)
+		this._failedFrom = null;                    // state at failure time (same, for ERROR)
 		this._alarmListeners = [];                  // operator-visible alarms -> status banner
 
 		this.state = SESSION.WELCOME;
@@ -499,10 +500,10 @@ export default class MovementSessionController {
 	/** Restart from the top (after done/error/halt). This is the ONLY thing that clears
 	 * the emergency-stop latch — an explicit operator action, never a state transition. */
 	reset() {
-		// A halt froze the state machine at HALTED, but the capture that was open when
-		// STOP was pressed is still open on the server. Close it against the state we
-		// halted FROM, not against HALTED.
-		const from = this._halted ? this._haltedFrom : this.state;
+		// A halt or a failure froze/overwrote the state (HALTED, ERROR), but the capture
+		// that was open at that moment is still open on the server. Close it against the
+		// state we came FROM, not against the terminal one we are sitting in.
+		const from = this._halted ? this._haltedFrom : (this._failedFrom ?? this.state);
 		this._clearSensorTimers();
 		this._stopTimedStim({ force: this._halted });
 		this.stim?.disable();
@@ -528,6 +529,7 @@ export default class MovementSessionController {
 		this._calibThenOnline = false;
 		this._halted = false;
 		this._haltedFrom = null;
+		this._failedFrom = null;
 		this.mode?.setMode('config');
 		this._derived = null;
 		this._calibSequence = null;
@@ -913,8 +915,9 @@ export default class MovementSessionController {
 		this._sensorStim = null;
 		this._mvPaused = false;
 		this.trainLog.push({ t: Date.now(), level: 'warn', line: `disconnected during "${was}"` });
-		this._fail('Connection lost during the block — cueing stopped. The server saves whatever '
-			+ 'was captured; reconnect, then Restart to run this block again.');
+		this._fail('Connection lost during the block — cueing stopped. What was captured is kept '
+			+ 'on the server; reconnect, then Restart (which closes the capture) before re-running '
+			+ 'this block.');
 	}
 
 	_onConfigStatus(msg) {
@@ -1109,6 +1112,11 @@ export default class MovementSessionController {
 			this._emit();
 			return;
 		}
+		// Remember what we were doing, exactly as emergencyStop() does for HALTED. ERROR
+		// otherwise erases it, and reset() would then close no capture at all — leaving
+		// an mv_record_*/mv_online_* capture open on the server, which refuses the next
+		// mv_record_start and blocks the re-run this error tells the operator to make.
+		if (this._failedFrom == null) this._failedFrom = this.state;
 		this.state = SESSION.ERROR;
 		this.message = message;
 		this._emit();
