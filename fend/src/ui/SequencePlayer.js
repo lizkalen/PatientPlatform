@@ -257,6 +257,9 @@ export default class SequencePlayer {
 		if (!this.config) return;
 
 		this._clearPhaseTimer();
+		// Leaving the current item is leaving its MOVE phase, but no phase change is
+		// emitted here — stop stimulation explicitly, as pause()/stop()/reset() do.
+		this._stopStimulation();
 		this.currentRepetition = 0;
 		this.currentItemIndex++;
 
@@ -282,6 +285,8 @@ export default class SequencePlayer {
 		if (!this.config) return;
 
 		this._clearPhaseTimer();
+		// See skipToNext: no phase change is emitted, so stop stimulation explicitly.
+		this._stopStimulation();
 		this.currentRepetition = 0;
 		this.currentItemIndex = Math.max(0, this.currentItemIndex - 1);
 
@@ -299,6 +304,8 @@ export default class SequencePlayer {
 		if (!this.config || index < 0 || index >= this.config.items.length) return;
 
 		this._clearPhaseTimer();
+		// See skipToNext: no phase change is emitted, so stop stimulation explicitly.
+		this._stopStimulation();
 		this.currentItemIndex = index;
 		this.currentRepetition = 0;
 
@@ -654,6 +661,11 @@ export default class SequencePlayer {
 				this._notifyChange();
 			});
 		} else {
+			// Same re-check the prepTime > 0 branch does inside its callback: this method
+			// awaited the model load and the tutorial, so playback may have been stopped
+			// while we were suspended. Without it, a Stop pressed during the tutorial is
+			// undone the moment the patient presses "I'm Ready" (prepTime === 0 only).
+			if (!this.isPlaying) return;
 			this._setPhase(PHASE.MOVE, 0);
 			this.webglView.play();
 			this._notifyChange();
