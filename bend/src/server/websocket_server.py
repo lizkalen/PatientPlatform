@@ -54,7 +54,8 @@ from server.stimulation_client import StimulationClient
 from server.stim_authority import StimAuthority, DEFAULT_MAX_TRAIN_SECONDS
 from server.recover_recording import (
     SPOOL_KIND, SPOOL_LAYOUT, SPOOL_SUFFIX, build_recording_payload, load_spool,
-    safe_name, sidecar_path, unique_path, write_pickle_atomic, write_sidecar,
+    safe_name, segment_paths, sidecar_path, unique_path, write_pickle_atomic,
+    write_sidecar,
 )
 
 
@@ -91,11 +92,17 @@ class RecordingState:
     start_time: Optional[datetime] = None
     metadata: Optional[dict] = None
     decomp: DecompositionRecordingState = field(default_factory=DecompositionRecordingState)
+    # Monotonic id of the recording session currently occupying this state.
+    # Bumped every time a recording opens; stop_recording captures it and only
+    # resets state it still owns. Without it, a slow stop's delayed cleanup
+    # wiped the state of a recording that started while it was finalising.
+    generation: int = 0
     # Spool state
     spool_path: Optional[str] = None
     spool_file: Optional[object] = None      # open binary writer, 1 MB buffered
     spool_samples: int = 0                   # samples written, pre-trigger included
-    spool_dtype: Optional[str] = None        # pinned at the first write
+    spool_dtype: Optional[str] = None        # pinned at the first write, widened never narrowed
+    spool_segments: list = field(default_factory=list)   # [{file, dtype}], see _spool_write
     pre_trigger_samples: int = 0
     # Non-zero only when a chunk failed to reach disk; surfaced in the saved file
     # so a recording with a gap is never silently passed off as complete.
@@ -244,6 +251,10 @@ class RippleWebSocketServer:
             broadcast=self.broadcast,
             max_train_seconds=stim_max_seconds,
         )
+
+        # Live references to fire-and-forget recording_warning broadcasts, so
+        # the tasks are not garbage-collected mid-flight.
+        self._recording_warning_tasks = set()
 
         # Teardown latch: run()'s finally and any direct shutdown() call must not
         # tear the same resources down twice.
@@ -1053,8 +1064,8 @@ class RippleWebSocketServer:
         second overwrote each other (audit P5).
         """
         meta = metadata or {}
-        subject = self._safe_name(meta.get("subjectId") or meta.get("subject"), "subject")
-        session = self._safe_name(meta.get("sessionId") or meta.get("session"), "session")
+        subject = safe_name(meta.get("subjectId") or meta.get("subject"), "subject")
+        session = safe_name(meta.get("sessionId") or meta.get("session"), "session")
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         return f"emg_recording_{subject}_{session}_{ts}"
 
@@ -1066,6 +1077,7 @@ class RippleWebSocketServer:
             "spool_file": os.path.basename(rec.spool_path or ""),
             "n_channels": self.n_channels,
             "dtype": rec.spool_dtype,
+            "segments": [dict(s) for s in rec.spool_segments],
             "layout": SPOOL_LAYOUT,
             "srate": self.sample_rate,
             "filtered": self.enable_filtering,
@@ -1091,13 +1103,16 @@ class RippleWebSocketServer:
         crash is always interpretable (audit P5 / recover_recording.py).
         """
         rec = self.recording
-        base = self._recording_base_name(metadata)
-        path = os.path.join(self.output_folder, base + SPOOL_SUFFIX)
+        path = os.path.join(self.output_folder,
+                            self._recording_base_name(metadata) + SPOOL_SUFFIX)
         try:
             rec.spool_path = unique_path(path)
             rec.spool_file = open(rec.spool_path, "wb", buffering=1 << 20)
             rec.spool_samples = 0
             rec.spool_dtype = None
+            rec.spool_segments = [{"file": os.path.basename(rec.spool_path),
+                                   "dtype": None}]
+            rec.generation += 1          # this state now belongs to a new recording
             write_sidecar(rec.spool_path, self._spool_sidecar_info())
             print(f"  Spool: {os.path.basename(rec.spool_path)} (incremental, "
                   f"crash-safe)")
@@ -1120,8 +1135,15 @@ class RippleWebSocketServer:
         """Append one channels-major chunk to the spool. Never raises.
 
         A write failure must not kill the acquisition loop, so it is counted and
-        reported rather than propagated - but it is never hidden: the count ends
-        up in the saved file and in the stop broadcast.
+        reported rather than propagated - and it is never hidden: the first one
+        broadcasts a `recording_warning` (see _notify_recording_warning),
+        rewrites the sidecar so the gap survives a crash, and the running total
+        ends up in the saved file.
+
+        The sample dtype is pinned at the first chunk. If a later chunk needs a
+        WIDER one, the stream continues into a new segment rather than being
+        cast down: the old in-RAM path ended in an hstack, which PROMOTED, so
+        narrowing here would silently truncate the recording.
         """
         rec = self.recording
         writer = rec.spool_file
@@ -1133,7 +1155,14 @@ class RippleWebSocketServer:
                 # promotes to float64, raw streams do not). Pin it and rewrite
                 # the sidecar so an orphan from here on is interpretable.
                 rec.spool_dtype = str(samples.dtype)
+                if rec.spool_segments:
+                    rec.spool_segments[-1]["dtype"] = rec.spool_dtype
                 write_sidecar(rec.spool_path, self._spool_sidecar_info())
+            elif str(samples.dtype) != rec.spool_dtype:
+                promoted = np.promote_types(np.dtype(rec.spool_dtype), samples.dtype)
+                if promoted != np.dtype(rec.spool_dtype):
+                    self._start_spool_segment(promoted)
+                    writer = rec.spool_file
             writer.write(np.ascontiguousarray(samples.T, dtype=rec.spool_dtype).tobytes())
             # Flush every chunk, but do NOT fsync. The failure this protects
             # against is process death - a closed console window, a crash, a
@@ -1153,7 +1182,73 @@ class RippleWebSocketServer:
                 print(f"[Recording] *** SPOOL WRITE FAILED: {e} — the recording "
                       f"now has a gap. Further failures are counted and reported "
                       f"with the saved file. ***")
+                # Persist the disclosure immediately: the sidecar is otherwise
+                # only rewritten at close, so a crash after an error would
+                # recover a file that looks complete.
+                try:
+                    write_sidecar(rec.spool_path, self._spool_sidecar_info())
+                except Exception:
+                    pass
+                self._notify_recording_warning(
+                    f"Recording data is being LOST: a spool write failed ({e}). "
+                    f"The recording now has a gap.")
             return False
+
+    def _start_spool_segment(self, dtype):
+        """Continue the recording into a new segment carrying a wider dtype.
+
+        Called only when a chunk arrives that cannot be stored in the pinned
+        dtype without loss. The alternative - rewriting the gigabytes already
+        spooled - is slow and, worse, not crash-safe: dying part-way through
+        leaves a file no sidecar can describe. Appending a segment is O(1), and
+        `load_spool` concatenates segments with numpy promotion, which is
+        exactly what the old hstack path did.
+
+        Ordering matters: the segment is registered in the sidecar BEFORE its
+        first byte exists, so a crash in that gap recovers every complete
+        segment and merely notes the missing one.
+        """
+        rec = self.recording
+        print(f"[Recording] sample dtype widened {rec.spool_dtype} -> {dtype}; "
+              f"continuing into a new spool segment rather than narrowing")
+        try:
+            rec.spool_file.flush()
+            rec.spool_file.close()
+        except Exception as e:
+            print(f"[Recording] could not close the previous spool segment: {e}")
+        path = f"{rec.spool_path}.{len(rec.spool_segments)}"
+        rec.spool_segments.append({"file": os.path.basename(path),
+                                   "dtype": str(dtype)})
+        rec.spool_dtype = str(dtype)
+        write_sidecar(rec.spool_path, self._spool_sidecar_info())
+        rec.spool_file = open(path, "wb", buffering=1 << 20)
+
+    def _notify_recording_warning(self, message: str):
+        """Broadcast a `recording_warning` from synchronous code.
+
+        Message shape:
+            {type: "recording_warning", recording: bool, message: str}
+
+        A separate message type rather than a field on `recording_status`:
+        that one carries the on/off flag the frontend latches on, and a warning
+        must not read as a state transition. Clients that do not know the type
+        drop it, which is the safe failure mode for a warning.
+
+        Fire-and-forget, because the caller is the acquisition loop and a
+        warning must never block or break it. A reference is held so the task
+        cannot be garbage-collected before it runs.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return                      # no running loop (sync context)
+        task = loop.create_task(self.broadcast({
+            "type": "recording_warning",
+            "recording": self.recording.is_recording,
+            "message": message,
+        }))
+        self._recording_warning_tasks.add(task)
+        task.add_done_callback(self._recording_warning_tasks.discard)
 
     def _close_spool(self):
         """Flush and close the spool. Returns (path, sidecar info) or (None, None)."""
@@ -1179,11 +1274,20 @@ class RippleWebSocketServer:
         return path, info
 
     @staticmethod
-    def _discard_spool(path: Optional[str]):
-        """Remove a spool and its sidecar. Only ever called once the .pkl exists."""
-        for target in (path, sidecar_path(path) if path else None):
-            if not target:
-                continue
+    def _discard_spool(path: Optional[str], info: Optional[dict] = None):
+        """Remove a spool, every segment of it, and its sidecar.
+
+        Only ever called once the .pkl is durably on disk. `info` is the
+        sidecar dict, needed because a recording whose dtype widened mid-run
+        spans several files (see _start_spool_segment).
+        """
+        if not path:
+            return
+        targets = [p for p, _ in segment_paths(path, info or {})]
+        if path not in targets:
+            targets.append(path)
+        targets.append(sidecar_path(path))
+        for target in targets:
             try:
                 os.remove(target)
             except FileNotFoundError:
@@ -1216,6 +1320,9 @@ class RippleWebSocketServer:
         Audit P5: this used to be the tail of `stop_recording`, so a `pkl.dump`
         failure skipped it and left `is_recording` False but the rest of the
         state populated - and the next `start_recording` then wiped the data.
+
+        `generation` is deliberately NOT reset: it is monotonic, and it is what
+        lets a slow stop tell its own state apart from a later recording's.
         """
         rec = self.recording
         rec.start_time = None
@@ -1225,6 +1332,7 @@ class RippleWebSocketServer:
         rec.spool_file = None
         rec.spool_samples = 0
         rec.spool_dtype = None
+        rec.spool_segments = []
         rec.pre_trigger_samples = 0
         rec.spool_write_errors = 0
         rec.spool_dropped_samples = 0
@@ -1367,15 +1475,27 @@ class RippleWebSocketServer:
             return
 
         self.recording.is_recording = False
+        # Everything below may await for seconds while the spool is reassembled,
+        # and a new recording can legitimately start in that window. Capture the
+        # generation now and only touch state that still belongs to us.
+        my_generation = self.recording.generation
         spool_path, info = self._close_spool()
+        write_errors = (info or {}).get("spool_write_errors")
 
         try:
             if not spool_path or not info or not info.get("n_samples"):
+                # Still a state transition: without recording_status the
+                # frontend's isRecording flag would stay latched forever.
+                await self.broadcast({
+                    "type": "recording_status",
+                    "recording": False,
+                    "message": "Recording stopped: no data was recorded"
+                })
                 await self.broadcast({
                     "type": "error",
                     "message": "No data was recorded"
                 })
-                self._discard_spool(spool_path)     # empty: nothing to preserve
+                self._discard_spool(spool_path, info)   # empty: nothing to preserve
                 return
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1416,13 +1536,13 @@ class RippleWebSocketServer:
             duration = n_samples / self.sample_rate if self.sample_rate else 0.0
             print(f"\n  Recording saved to: {os.path.abspath(filepath)}")
             print(f"  Duration: {duration:.1f}s, Channels: {self.n_channels}")
-            if self.recording.spool_write_errors:
-                print(f"  WARNING: {self.recording.spool_write_errors} spool write "
-                      f"error(s), ~{self.recording.spool_dropped_samples} samples "
+            if write_errors:
+                print(f"  WARNING: {write_errors.get('count')} spool write "
+                      f"error(s), ~{write_errors.get('dropped_samples')} samples "
                       f"missing — recorded in the saved file")
 
             # Durably written: only now may the spool go.
-            self._discard_spool(spool_path)
+            self._discard_spool(spool_path, info)
 
             await self.broadcast({
                 "type": "recording_status",
@@ -1439,8 +1559,16 @@ class RippleWebSocketServer:
             })
         finally:
             # Every exit path, including the failed save: the next
-            # start_recording must find a clean slate (audit P5).
-            self._reset_recording_state()
+            # start_recording must find a clean slate (audit P5). But ONLY if
+            # this state is still ours - a recording that started while the
+            # reassembly above was in flight owns it now, and wiping its spool
+            # handle mid-session silently dropped every subsequent sample.
+            if self.recording.generation == my_generation:
+                self._reset_recording_state()
+            else:
+                print(f"[Recording] not resetting state: recording generation "
+                      f"{self.recording.generation} started while generation "
+                      f"{my_generation} was being saved")
 
     def _close_device(self):
         """Tear down the current device connection (best-effort)."""
