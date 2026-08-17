@@ -1,0 +1,71 @@
+{
+    "Name": "CBSS v2 Configuration",
+    "Description": "CBSS parameters plus the channel preprocessing, rank-truncated whitening and motor unit validity parameters taken from corrected_ckc. Every key under Config maps to an attribute of CBSSv2, except start_time, end_time and sampling_frequency which are consumed by decompose_cbss_v2. Use null (not the string \"None\") to disable an option.",
+
+    "Config": {
+        "start_time": 0,
+        "end_time": -1,
+        "sampling_frequency": 2000,
+
+        "channel_criteria": ["amplitude", "auto_muap_band"],
+        "criterion_bandpass": [20, 500],
+        "drop_channels": null,
+        "amplitude_kwargs": {"hi": 4.0, "lo": 0.05, "kurt_th": 20.0},
+        "muap_band_kwargs": {"floor": 0.35, "min_sep": 0.15, "min_low_frac": 0.05, "max_low_frac": 0.7},
+        "common_mode_k": 2,
+        "zscore_channels": true,
+
+        "apply_filters": false,
+        "bandpass": [20, 500],
+        "bandpass_order": 2,
+        "notch_frequency": 50,
+        "notch_n_harmonics": 3,
+        "notch_order": 2,
+        "notch_width": 1,
+
+        "ext_fact": 16,
+        "whitening_method": "ZCA",
+        "whitening_reg": "auto",
+        "whitening_rank_trunc": 1e-3,
+
+        "ica_n_iter": 100,
+        "opt_initalization": "activity_idx",
+        "opt_function_exp": 2,
+        "opt_max_iter": 100,
+        "opt_tol": 1e-4,
+        "source_deflation": "gram-schmidt",
+        "peel_off": true,
+        "fr_peeloff": false,
+        "cluster_method": "kmeans",
+        "random_seed": 1909,
+        "refinement_loop": true,
+
+        "sil_th": 0.85,
+        "cov_th": 0.3,
+        "min_firing_rate": 10,
+        "match_th": 0.3,
+        "match_max_shift": 0.1,
+        "match_tol": 0.001,
+
+        "validity_gate": "annotate",
+        "validity_thresholds": {
+            "min_spikes": 20,
+            "min_split_half_r": 0.6,
+            "min_wf_snr": 6.0,
+            "min_n_focal_ch": 3,
+            "max_focality_frac": 0.12,
+            "min_peak_floor": 6.0,
+            "min_biphasic": 0.25,
+            "max_defl_ms": 6.0,
+            "max_refrac_viol": 0.1
+        },
+        "validity_half_ms": 10.0,
+        "validity_top_m": 16,
+
+        "recalibrate_filters": false,
+
+        "verbose_mode": false,
+        "output_source_plot": false,
+        "plot_all_sources": false
+    }
+}

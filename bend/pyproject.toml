@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "patientgui-bend"
+version = "0.1.0"
+description = "PatientGUI backend: realtime EMG acquisition, decomposition and movement decoding"
+requires-python = ">=3.10"
+
+# Intentionally empty. The runtime environment is owned by `patientgui.yml` (conda) —
+# declaring dependencies here as well would let pip and conda fight over the same packages.
+# Install with `pip install -e ./bend --no-deps` into the existing `patientgui` env.
+dependencies = []
+
+# `bend/src` is the single import root for the whole repository. Packages are discovered
+# automatically so this file does not need editing as packages are added, renamed or removed
+# during the refactor (see docs/REFACTORING_PLAN.md).
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"

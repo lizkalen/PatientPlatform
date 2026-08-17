@@ -1,0 +1,27 @@
+{
+  "name": "First Movement Patient",
+  "metadata": {
+    "subjectId": "LastFingersFlexion",
+    "sessionId": "LastFingersFlexion",
+    "notes": ""
+  },
+  "settings": {
+    "restBetweenReps": 7,
+    "prepTime": 3,
+    "pauseBetweenItems": 120,
+    "playbackSpeed": 1,
+    "loopSequence": false
+  },
+  "items": [
+    {
+      "model": "lastfingers.glb",
+      "animation": 0,
+      "repetitions": 1
+    },
+    {
+      "model": "fastlastfingers.glb",
+      "animation": 0,
+      "repetitions": 8
+    }
+  ]
+}

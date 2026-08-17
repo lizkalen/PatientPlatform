@@ -1,0 +1,27 @@
+{
+  "name": "First Movement Patient",
+  "metadata": {
+    "subjectId": "FingerExt",
+    "sessionId": "FingerExt",
+    "notes": ""
+  },
+  "settings": {
+    "restBetweenReps": 7,
+    "prepTime": 3,
+    "pauseBetweenItems": 120,
+    "playbackSpeed": 1,
+    "loopSequence": false
+  },
+  "items": [
+    {
+      "model": "fingerext.glb",
+      "animation": 0,
+      "repetitions": 1
+    },
+    {
+      "model": "fastfingerext.glb",
+      "animation": 0,
+      "repetitions": 8
+    }
+  ]
+}

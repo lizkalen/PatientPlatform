@@ -1,0 +1,331 @@
+# EMG Simulation Configuration
+# All parameters based on research findings from Negro et al. 2016 and subsequent work
+
+# Simulation settings
+simulation:
+  fs: 2000                    # Sampling frequency (Hz)
+  duration: null              # Total duration (seconds) - computed from movement if null
+  n_channels: 65              # Number of electrode channels
+  n_motor_units: 200          # Number of motor units to simulate
+  seed: 42                    # Random seed for reproducibility
+
+# Motor unit properties (based on size principle)
+motor_units:
+  recruitment:
+    threshold_min: 0.1        # Minimum recruitment threshold (normalized)
+    threshold_max: 0.8        # Maximum recruitment threshold (normalized)
+    range_factor: 50          # RP parameter for exponential distribution (50-100)
+    derecruitment_factor: 0.8 # Derecruitment at 80% of recruitment threshold
+  
+
+  #Legacy
+
+  firing_rates:
+    base_min: 8.0             # Minimum base firing rate (Hz)
+    base_max: 15.0            # Maximum base firing rate (Hz)
+    modulation_factor: 2.0    # Multiplicative factor for rate modulation
+    baseline_factor: 0.3      # Fraction of base rate during rest
+    refractory_period: 0.020  # Refractory period (seconds)
+    jitter: 0.15              # CoV for inter-spike interval jitter
+  
+  type_distribution:
+
+
+    slow: 0.5
+    fast_oxidative: 0.3
+    fast_glycolytic: 0.2
+
+  firing_characteristics:
+    # Slow (Type I)
+    slow:
+      base_rate: [8, 12]     # Hz
+      max_rate: [25, 35]      # Hz
+      adaptation_tau: 0.5     # seconds (slow adaptation)
+      initial_burst: false    # No doublets
+    
+    # Fast oxidative (Type IIa)  
+    fast_oxidative:
+      base_rate: [12, 20]     # Hz
+      max_rate: [35, 50]      # Hz
+      adaptation_tau: 0.3     # seconds
+      initial_burst: true     # Can show doublets
+    
+    # Fast glycolytic (Type IIx)
+    fast_glycolytic:
+      base_rate: [15, 25]     # Hz
+      max_rate: [50, 120]     # Hz (ballistic!)
+      adaptation_tau: 0.15    # seconds (rapid adaptation)
+      initial_burst: true     # Always show doublets
+
+  functional_groups:
+    stabilizers:
+      fraction: 0.3
+      default_gain: 1.0           # Active everywhere
+      phase_gains:
+        hold: 1.2                 # Slightly elevated during holds
+        pour: 1.1
+      base_activity: 0.2          # Keep: baseline firing at rest
+    
+    reach_extension:
+      fraction: 0.15
+      default_gain: 0.5           # Participates weakly in other phases
+      phase_gains:
+        reach: 1.4                # Primary phases
+        return: 1.3
+        grasp: 0.7                # Some contribution
+        lift: 0.6
+        pour: 0.4
+      muscle_role: 'agonist'
+    
+    grasp_flexion:
+      fraction: 0.2
+      default_gain: 0.4
+      phase_gains:
+        grasp: 1.5                # High during grip
+        lift: 1.3
+        hold: 1.2
+        pour: 0.9                 # Still active to maintain grip
+        reach: 0.5
+        return: 0.6
+      muscle_role: 'agonist'
+    
+    pour_extension:
+      fraction: 0.25
+      default_gain: 0.3           # Low but not silent elsewhere
+      phase_gains:
+        pour: 1.5                 # Primary phase
+        lift: 0.6                 # Some preparation
+        hold: 0.5
+      muscle_role: 'agonist'
+      high_activity: true         # Keep: 30% rate boost
+    
+    pour_pronation:
+      fraction: 0.1
+      default_gain: 0.3
+      phase_gains:
+        pour: 1.3
+        lift: 0.5                 # Preparatory
+        return: 0.7               # Controlling return rotation
+      muscle_role: 'synergist'
+
+# MUAP properties
+muap:
+  duration_samples: 20        # Base MUAP duration (samples)
+  amplitude_min: 0.5          # Minimum MUAP amplitude
+  amplitude_max: 1.5          # Maximum MUAP amplitude
+  
+  # Time-varying MUAP parameters
+  time_varying:
+    enabled: true             # Enable dynamic MUAP changes
+    amplitude_variation: 1.55 # Max/min amplitude ratio (155% from research)
+    duration_min_scale: 0.8   # Minimum duration scaling
+    duration_max_scale: 1.2   # Maximum duration scaling
+    n_length_bins: 5          # Discrete muscle length states to pre-compute
+    n_pennation_bins: 5       # Discrete pennation angle states to pre-compute
+
+# Geometric state parameters
+geometry:
+  muscle_length:
+    min: 0.7                  # Shortest normalized length
+    max: 1.3                  # Longest normalized length
+    neutral: 1.0              # Neutral/optimal length
+  
+  pennation_angle:
+    baseline: 20.0            # Resting pennation angle (degrees)
+    slope: 15.0               # Change per unit activation (degrees) - Soleus: 16.1
+    min: 15.0                 # Minimum pennation angle (degrees)
+    max: 40.0                 # Maximum pennation angle at MVC (degrees)
+  
+  muscle_thickness:
+    baseline_factor: 1.0      # Baseline thickness multiplier
+    increase_factor: 0.2      # Fractional increase at full activation (0.1-0.3)
+  
+  conduction_velocity: 4.0    # Action potential conduction velocity (m/s)
+
+# Mixing and propagation
+mixing:
+  weight_min: 0.1             # Minimum mixing weight
+  weight_max: 1.0             # Maximum mixing weight
+  delay_min: 0                # Minimum propagation delay (samples)
+  delay_max: 10               # Maximum propagation delay (samples)
+
+# Noise parameters
+noise:
+  gaussian_level: 0.05        # Gaussian noise std as fraction of signal std (5%)
+  baseline_level: 0.002       # Baseline noise level (absolute)
+  motion_artifact:
+    enabled: false            # Enable motion artifacts (future)
+    frequency_range: [0, 40]  # Motion artifact frequency range (Hz)
+    amplitude_scale: 0.01     # Motion artifact amplitude scaling
+
+# Movement patterns
+movements:
+  simple:
+    n_repetitions: 20         # Number of contraction-rest cycles
+    contraction_duration: 5.0 # Contraction duration (seconds)
+    rest_duration: 3.0        # Rest duration (seconds)
+    ramp_duration: 0.5        # Ramp up/down duration (seconds)
+    force_fs: 100             # Force profile sampling frequency (Hz)
+  
+  pouring:
+    n_pours: 10                # Number of pouring cycles
+    reach_duration: 1.0       # Reach phase duration (seconds)
+    grasp_duration: 0.5       # Grasp phase duration (seconds)
+    lift_duration: 0.5        # Lift phase duration (seconds)
+    pour_duration: 2.0        # Pour phase duration (seconds)
+    return_duration: 1.0      # Return phase duration (seconds)
+    release_duration: 0.5     # Release phase duration (seconds)
+    rest_between: 2.0         # Rest between pours (seconds)
+    oscillation:
+      enabled: true           # Enable pouring oscillation
+      frequency: 1.5          # Oscillation frequency (Hz)
+      amplitude: 0.15         # Oscillation amplitude (normalized)
+    force_fs: 100             # Force profile sampling frequency (Hz)
+  
+  reaching:
+    n_reaches: 5              # Number of reach cycles
+    reach_duration: 0.8       # Reach phase duration (seconds)
+    hold_duration: 0.5        # Hold phase duration (seconds)
+    return_duration: 0.8      # Return phase duration (seconds)
+    rest_duration: 2.0        # Rest duration (seconds)
+    force_fs: 100             # Force profile sampling frequency (Hz)
+  
+  ballistic:
+    n_bursts: 10              # Number of ballistic bursts
+    burst_duration: 0.1       # Burst duration (seconds)
+    rest_duration: 1.0        # Rest between bursts (seconds)
+    force_fs: 100             # Force profile sampling frequency (Hz)
+
+
+   
+kinematic_profiles:
+  
+  # Pouring task: reach, grasp, lift, pour, return, release
+  pouring:
+    joints: 
+      - elbow_flexion
+      - wrist_flexion
+      - forearm_pronation
+    
+    phase_targets:
+      rest:
+        elbow_flexion: 90.0       # Neutral resting position
+        wrist_flexion: 0.0
+        forearm_pronation: 0.0
+      
+      reach:
+        elbow_flexion: 140.0      # Extend arm to reach forward
+        wrist_flexion: -10.0      # Slight wrist extension
+        forearm_pronation: 0.0    # Neutral
+      
+      grasp:
+        elbow_flexion: 130.0      # Maintain extended position
+        wrist_flexion: 5.0        # Slight flexion for grip stability
+        forearm_pronation: 0.0
+      
+      lift:
+        elbow_flexion: 90.0       # Flex to lift container
+        wrist_flexion: 0.0        # Return to neutral
+        forearm_pronation: -20.0  # Slight supination for stability
+      
+      pour:
+        elbow_flexion: 85.0       # Slight flexion for control
+        wrist_flexion: 25.0       # Extension to tilt container
+        forearm_pronation: 60.0   # Pronation to pour liquid
+        oscillations:             # Oscillatory wrist motion during pouring
+          wrist_flexion:
+            amplitude: 8.0        # ±8° oscillation
+            frequency: 1.5        # 1.5 Hz (matches force oscillation)
+            phase_offset: 0.0
+      
+      return:
+        elbow_flexion: 100.0      # Slight extension to return
+        wrist_flexion: 0.0        # Return to neutral
+        forearm_pronation: 0.0    # Return to neutral
+      
+      release:
+        elbow_flexion: 110.0      # Extend slightly to release
+        wrist_flexion: -5.0       # Slight extension
+        forearm_pronation: 0.0
+  
+
+
+
+
+  # Reaching task: concentric-isometric-eccentric sequence
+  reaching:
+    joints:
+      - elbow_flexion
+      - wrist_flexion
+    
+    phase_targets:
+      rest:
+        elbow_flexion: 90.0       # Starting position
+        wrist_flexion: 0.0
+      
+      reach:
+        elbow_flexion: 45.0       # Flex to reach target (concentric)
+        wrist_flexion: 10.0       # Slight wrist flexion
+      
+      hold:
+        elbow_flexion: 45.0       # Maintain position (isometric)
+        wrist_flexion: 10.0
+      
+      return:
+        elbow_flexion: 90.0       # Return to start (eccentric)
+        wrist_flexion: 0.0
+  
+  # Ballistic task: explosive rapid flexion
+  ballistic:
+    joints:
+      - elbow_flexion
+    
+    phase_targets:
+      rest:
+        elbow_flexion: 90.0       # Starting position
+      
+      ballistic_burst:
+        elbow_flexion: 45.0       # Rapid flexion to 45°
+
+# =============================================================================
+# MUSCLE-JOINT MAPPING
+# =============================================================================
+# Defines how joint angles affect muscle lengths
+# Each muscle can be affected by one or more joints
+# =============================================================================
+
+
+  
+# Muscle-joint mapping 
+muscle_joint_mapping:
+  forearm_flexors:
+    joint: elbow_flexion
+    reference_angle: 90.0
+    length_at_reference: 1.0
+    length_change_per_deg: -0.003
+  
+  wrist_extensors:
+    joint: wrist_flexion
+    reference_angle: 0.0
+    length_at_reference: 1.0
+    length_change_per_deg: -0.004
+  
+  forearm_pronators:
+    joint: forearm_pronation
+    reference_angle: 0.0
+    length_at_reference: 1.0
+    length_change_per_deg: -0.002
+
+# Output settings
+output:
+  save_ground_truth: false     # Save ground truth data
+  save_signals: false          # Save EMG signals
+  verbose: false               # Print progress
+  plot: false                 # Generate plots 
+
+# Validation thresholds (based on research)
+validation:
+  expected_frequency_range: [50, 100]  # Median frequency range (Hz)
+  expected_kurtosis_range: [2, 4]      # Expected kurtosis for EMG
+  min_decomposition_accuracy: 0.85     # Minimum acceptable accuracy (85%)
+  expected_rate_of_agreement: 0.90     # Expected rate of agreement (90%)

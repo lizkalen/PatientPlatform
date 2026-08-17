@@ -1,0 +1,27 @@
+{
+  "name": "Second Movement Patient",
+  "metadata": {
+    "subjectId": "Stroke4Ext",
+    "sessionId": "FastExt",
+    "notes": ""
+  },
+  "settings": {
+    "restBetweenReps": 57,
+    "prepTime": 3,
+    "pauseBetweenItems": 60,
+    "playbackSpeed": 1,
+    "loopSequence": false
+  },
+  "items": [
+    {
+      "model": "lastfingers.glb",
+      "animation": 0,
+      "repetitions": 8
+    },
+    {
+      "model": "tripodpinch.glb",
+      "animation": 0,
+      "repetitions": 8
+    }
+  ]
+}

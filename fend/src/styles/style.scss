@@ -1,0 +1,310 @@
+@use '_tweakpane';
+@use '_patient-mode';
+
+html, body, #app {
+  height: 100%;
+}
+
+body {
+  background-color: #000;
+  margin: 0;
+  overflow: hidden;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+}
+
+#app canvas {
+  display: block;
+  width: 100%;
+  flex: 1 1 auto;
+}
+
+.timeline {
+  flex: 0 0 auto;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  background: rgba(10, 10, 10, 0.85);
+  backdrop-filter: blur(8px);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.92);
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+}
+
+.timeline__controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.timeline__btn {
+  background: rgba(255, 255, 255, 0.10);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  color: rgba(255, 255, 255, 0.92);
+  border-radius: 10px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+.timeline__btn:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.timeline__label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.timeline__track {
+  width: 280px;
+  max-width: 40vw;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: rgba(255, 255, 255, 0.92);
+  border-radius: 10px;
+  padding: 6px 10px;
+}
+
+.timeline__track:focus {
+  outline: none;
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
+.timeline__speed {
+  width: 140px;
+}
+
+.timeline__speedValue {
+  width: 44px;
+  text-align: right;
+  opacity: 0.85;
+}
+
+.timeline__time {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
+}
+
+.timeline__kf {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.75;
+}
+
+.timeline__scrub {
+  position: relative;
+  height: 22px;
+}
+
+.timeline__range {
+  position: relative;
+  width: 100%;
+  z-index: 2;
+}
+
+.timeline__markers {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 12px;
+  transform: translateY(-50%);
+  z-index: 4;
+  pointer-events: none;
+}
+
+.timeline__marker {
+  position: absolute;
+  top: 0;
+  width: 2px;
+  height: 12px;
+  background: rgba(255, 255, 255, 0.75);
+}
+
+// Segment overlay layer
+.timeline__segments {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  z-index: 1;
+}
+
+.timeline__segment {
+  position: absolute;
+  height: 100%;
+  cursor: pointer;
+  opacity: 0.35;
+  transition: opacity 0.15s ease;
+  border-radius: 3px;
+
+  &--movement {
+    background: #4a90d9;
+  }
+
+  &--rest {
+    background: #d9a84a;
+  }
+
+  &:hover {
+    opacity: 0.5;
+  }
+
+  &--selected {
+    opacity: 0.55;
+    outline: 2px solid rgba(255, 255, 255, 0.8);
+    outline-offset: -2px;
+  }
+}
+
+.timeline__segment-handle {
+  position: absolute;
+  top: 0;
+  width: 8px;
+  height: 100%;
+  cursor: ew-resize;
+  background: rgba(255, 255, 255, 0.4);
+  opacity: 0;
+  transition: opacity 0.15s ease;
+
+  &--start {
+    left: 0;
+    border-radius: 3px 0 0 3px;
+  }
+
+  &--end {
+    right: 0;
+    border-radius: 0 3px 3px 0;
+  }
+
+  .timeline__segment:hover &,
+  .timeline__segment--selected & {
+    opacity: 1;
+  }
+}
+
+// Add segment mode indicator
+.timeline__scrub--adding {
+  cursor: crosshair;
+
+  .timeline__range {
+    pointer-events: none; // Disable scrubbing while adding segments
+  }
+
+  .timeline__segments {
+    z-index: 10; // Bring segments layer to front for interaction
+  }
+}
+
+// Movement mode
+.timeline__scrub--adding-movement {
+  .timeline__segments {
+    background: rgba(74, 144, 217, 0.08);
+    outline: 2px dashed rgba(74, 144, 217, 0.5);
+    outline-offset: -2px;
+  }
+}
+
+// Rest mode
+.timeline__scrub--adding-rest {
+  .timeline__segments {
+    background: rgba(217, 168, 74, 0.08);
+    outline: 2px dashed rgba(217, 168, 74, 0.5);
+    outline-offset: -2px;
+  }
+}
+
+// Preview segment while dragging to create
+.timeline__segment-preview {
+  position: absolute;
+  height: 100%;
+  border-radius: 3px;
+  pointer-events: none;
+  z-index: 5;
+
+  &--movement {
+    background: rgba(74, 144, 217, 0.4);
+    border: 2px dashed rgba(74, 144, 217, 0.9);
+  }
+
+  &--rest {
+    background: rgba(217, 168, 74, 0.4);
+    border: 2px dashed rgba(217, 168, 74, 0.9);
+  }
+}
+
+// Segment mode status bar
+.timeline__mode-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+
+  &--movement {
+    background: rgba(74, 144, 217, 0.25);
+    color: #7ab3ed;
+  }
+
+  &--rest {
+    background: rgba(217, 168, 74, 0.25);
+    color: #e8c77a;
+  }
+}
+
+.timeline__mode-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  animation: pulse 1.5s ease-in-out infinite;
+
+  .timeline__mode-indicator--movement & {
+    background: #4a90d9;
+  }
+
+  .timeline__mode-indicator--rest & {
+    background: #d9a84a;
+  }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(0.85); }
+}
+
+// Segment legend
+.timeline__legend {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.timeline__legend-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.timeline__legend-color {
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+
+  &--movement {
+    background: #4a90d9;
+  }
+
+  &--rest {
+    background: #d9a84a;
+  }
+}

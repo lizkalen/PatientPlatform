@@ -1,0 +1,49 @@
+{
+  "Config": {
+    "sampling_frequency": 2048,
+    "start_time": 0,
+    "end_time": 1000,
+    "debug":true,
+
+    "apply_bandpass": false,
+    "bandpass": [20, 500],
+    "bandpass_order": 4,
+    "apply_notch": false,
+    "notch_frequency": 50,
+    "notch_n_harmonics": 3,
+    "notch_order": 2,
+    "notch_width": 1,
+
+    "contrast": "square",
+
+    "ext_fact": 16,
+    "cov_reg": "auto",
+    "cxx_mode": "current",
+
+    "muap_duration": 64,
+    "muap_extraction": "STA",
+    "use_pca": false,
+    "pca_var": 0.9,
+    "recon_method": "centered_peak",
+
+    "stage1_max_mu": 100,
+    "stage1_max_iter": 300,
+    "stage1_min_spikes": 5,
+
+    "decomp_mode": "iteration",
+    "refine_max_iter": 100,
+    "iter_tol": 0.01,
+
+    "cluster_method": "kmeans",
+    "sil_th": 0.8,
+    "cov_th": 1,
+    "min_firing_rate": 0.5,
+
+    "match_th": 0.3,
+    "match_max_shift": 0.1,
+    "match_tol": 0.001,
+
+    "random_seed": 1909,
+    "verbose_mode": true
+  }
+}

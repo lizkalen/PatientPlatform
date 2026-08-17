@@ -1,0 +1,27 @@
+{
+  "name": "First Movement Patient",
+  "metadata": {
+    "subjectId": "Stroke0",
+    "sessionId": "SlowExt",
+    "notes": ""
+  },
+  "settings": {
+    "restBetweenReps": 7,
+    "prepTime": 3,
+    "pauseBetweenItems": 60,
+    "playbackSpeed": 1,
+    "loopSequence": false
+  },
+  "items": [
+    {
+      "model": "wristext.glb",
+      "animation": 0,
+      "repetitions": 1
+    },
+    {
+      "model": "fingerext.glb",
+      "animation": 0,
+      "repetitions": 1
+    }
+  ]
+}

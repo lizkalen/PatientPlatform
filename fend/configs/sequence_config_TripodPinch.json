@@ -1,0 +1,27 @@
+{
+  "name": "First Movement Patient",
+  "metadata": {
+    "subjectId": "TripodPinch",
+    "sessionId": "TripodPinch",
+    "notes": ""
+  },
+  "settings": {
+    "restBetweenReps": 7,
+    "prepTime": 3,
+    "pauseBetweenItems": 120,
+    "playbackSpeed": 1,
+    "loopSequence": false
+  },
+  "items": [
+    {
+      "model": "tripodpinch.glb",
+      "animation": 0,
+      "repetitions": 1
+    },
+    {
+      "model": "fasttripodpinch.glb",
+      "animation": 0,
+      "repetitions": 8
+    }
+  ]
+}

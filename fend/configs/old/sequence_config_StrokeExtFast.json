@@ -1,0 +1,27 @@
+{
+  "name": "First Movement Patient",
+  "metadata": {
+    "subjectId": "Stroke1Ext",
+    "sessionId": "FastExt",
+    "notes": ""
+  },
+  "settings": {
+    "restBetweenReps": 57,
+    "prepTime": 3,
+    "pauseBetweenItems": 60,
+    "playbackSpeed": 1,
+    "loopSequence": false
+  },
+  "items": [
+    {
+      "model": "fastwristext.glb",
+      "animation": 0,
+      "repetitions": 8
+    },
+    {
+      "model": "fastfingerext.glb",
+      "animation": 0,
+      "repetitions": 8
+    }
+  ]
+}

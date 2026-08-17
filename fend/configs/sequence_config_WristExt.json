@@ -1,0 +1,27 @@
+{
+  "name": "First Movement Patient",
+  "metadata": {
+    "subjectId": "WristExt",
+    "sessionId": "WristExt",
+    "notes": ""
+  },
+  "settings": {
+    "restBetweenReps": 7,
+    "prepTime": 3,
+    "pauseBetweenItems": 120,
+    "playbackSpeed": 1,
+    "loopSequence": false
+  },
+  "items": [
+    {
+      "model": "wristext.glb",
+      "animation": 0,
+      "repetitions": 1
+    },
+    {
+      "model": "fastwristext.glb",
+      "animation": 0,
+      "repetitions": 8
+    }
+  ]
+}

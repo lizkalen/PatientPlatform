@@ -1,0 +1,25 @@
+.venv/
+data/
+__pycache__/
+3dmodels/
+images/
+simresults/
+recordings/
+notebooks/logs/kynematics.txt
+logs/
+output/
+output2/
+output3/
+output4/
+analysis_results/
+notebooks/results/
+notebooks/results_old/
+neuromotion_results/
+neuromotion_results_old/
+neuromotion_results_old_nopen/
+neuromotion_scd_results/
+neuromotion_bss_results/
+res/
+
+# build artifacts from `pip install -e ./bend`
+*.egg-info/

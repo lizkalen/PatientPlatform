@@ -1,0 +1,57 @@
+
+{
+
+ "C:\\Users\\velar\\Documents\\32ch_G_Forearm":{
+    "runs":{
+        "datafile1_filtered.npz":{
+            "start_time": 10.0,
+            "end_time": 27.0
+        },
+        "datafile4_filtered.npz":{
+            "start_time": 5.0,
+            "end_time": 16.0
+        }
+    },
+    "sampling_frequency": 2000
+    },
+
+    "C:\\Users\\velar\\Documents\\32ch_G_Forearm2":{
+    "runs":{
+
+        "datafile1_filtered.npz":{
+            "start_time": 10.0,
+            "end_time": 27.0
+        },
+        "datafile4_filtered.npz":{
+            "start_time": 12.0,
+            "end_time": 27.0
+        },
+        "datafile12_filtered.npz":{
+            "start_time": 12.0,
+            "end_time": 27.0
+        },
+        "datafile13_filtered.npz":{
+            "start_time":12.0,
+            "end_time": 27.0
+
+            },
+        "datafile14_filtered.npz":{
+            "start_time":12.0,
+            "end_time": 24.0
+            },
+        "datafile15_filtered.npz":{
+            "start_time":10.0,
+            "end_time": 27.0
+            },
+        "datafile16_filtered.npz":{
+            "start_time":10.0,
+            "end_time": 27.0
+            },
+        "datafile17_filtered.npz":{
+            "start_time":10.0,
+            "end_time": 27.0
+            }
+    },
+    "sampling_frequency": 2000
+    }
+}
