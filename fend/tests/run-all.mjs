@@ -22,6 +22,7 @@ const SUITES = [
 	'./stop-retry-reconnect.test.mjs',
 	'./sensor-hard-stop.test.mjs',
 	'./disconnect-recovery.test.mjs',
+	'./status-banner.test.mjs',
 ];
 
 const results = [];
