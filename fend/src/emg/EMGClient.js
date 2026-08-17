@@ -685,6 +685,14 @@ export default class EMGClient {
 		console.log(`EMGClient: Server info - ${this.nChannels} channels @ ${this.sampleRate} Hz` +
 			(this.decompositionActive ? `, decomposition active (${this.nMUs} MUs)` : ''));
 
+		// Rehydrate BEFORE the connect callbacks. Both describe the same instant, but the
+		// rehydrated values are a snapshot taken when the socket opened, while onConnect
+		// subscribers ACT on the reconnect (the stim drivers retry a stop that never went
+		// out). Running the snapshot last would let it overwrite the result of that
+		// action — a forced stop, followed by `stimulation_active: true` from before the
+		// stop, flipping the driver's belief back to "stimulating".
+		this._rehydrateStatusFromConnect(msg);
+
 		for (const cb of this.onConnectCallbacks) {
 			cb({
 				sampleRate: this.sampleRate,
@@ -698,8 +706,6 @@ export default class EMGClient {
 				stimulationActive: this.stimulationActive,
 			});
 		}
-
-		this._rehydrateStatusFromConnect(msg);
 	}
 
 	/**
@@ -712,7 +718,11 @@ export default class EMGClient {
 	 * DecompositionView with no MU rows, MovementStimController un-armed, and the
 	 * stim-binary toggle showing a stale label.
 	 *
-	 * Runs after onConnect so listeners have channel count / sample rate first.
+	 * Runs BEFORE the onConnect callbacks so that anything a subscriber DOES on the
+	 * reconnect is the last word over this pre-connect snapshot (see _handleConnected).
+	 * Channel count / sample rate are already assigned as fields by then, so consumers
+	 * that need them still read the current values.
+	 *
 	 * Every consumer handles `active: false`, so a fresh connect is a safe no-op.
 	 */
 	_rehydrateStatusFromConnect(msg) {
