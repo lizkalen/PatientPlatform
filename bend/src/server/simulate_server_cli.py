@@ -90,6 +90,14 @@ def main(
     This mimics the RippleWebSocketServer but uses pre-recorded data instead of
     real hardware, useful for testing the frontend without Ripple equipment.
     """
+    if stim_max_seconds <= 0:
+        raise typer.BadParameter(
+            "must be greater than 0. It is the hard deadline that stops a "
+            "stimulation train; 0 or negative would fire the watchdog "
+            "immediately and make stimulation unusable.",
+            param_hint="--stim-max-seconds",
+        )
+
     from server.simulated_websocket_server import SimulatedWebSocketServer
 
     print(f"Starting simulated EMG WebSocket server")

@@ -111,6 +111,14 @@ def main(
     ),
 ):
     """Start the Quattrocento (OTBioLab+) + WebSocket server."""
+    if stim_max_seconds <= 0:
+        raise typer.BadParameter(
+            "must be greater than 0. It is the hard deadline that stops a "
+            "stimulation train; 0 or negative would fire the watchdog "
+            "immediately and make stimulation unusable.",
+            param_hint="--stim-max-seconds",
+        )
+
     from server.websocket_server import RippleWebSocketServer
     from server.devices.quattrocento import QuattrocentoDevice, parse_otb_config, CLOCK_RATE
 
