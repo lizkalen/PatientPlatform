@@ -55,6 +55,7 @@ export default class EMGClient {
 		this.onDataCallbacks = [];
 		this.onRecordingStatusCallbacks = [];
 		this.onRecordingSavedCallbacks = [];
+		this.onRecordingWarningCallbacks = [];
 		this.onErrorCallbacks = [];
 		this.onDecompositionStatusCallbacks = [];
 		this.onDecompositionDataCallbacks = [];
@@ -496,6 +497,15 @@ export default class EMGClient {
 		this.onRecordingSavedCallbacks.push(callback);
 	}
 
+	/**
+	 * The recording is still running but something went wrong with it — the server's
+	 * first spool write error, naming dropped samples / a gap.
+	 * @param {Function} callback - ({ recording, message })
+	 */
+	onRecordingWarning(callback) {
+		this.onRecordingWarningCallbacks.push(callback);
+	}
+
 	onError(callback) {
 		this.onErrorCallbacks.push(callback);
 	}
@@ -638,6 +648,10 @@ export default class EMGClient {
 
 			case 'recording_saved':
 				this._handleRecordingSaved(msg);
+				break;
+
+			case 'recording_warning':
+				this._handleRecordingWarning(msg);
 				break;
 
 			case 'status':
@@ -852,6 +866,21 @@ export default class EMGClient {
 				nChannels: msg.n_channels,
 				nSamples: msg.n_samples,
 			});
+		}
+	}
+
+	/**
+	 * `recording_warning`: { recording, message } — a fault DURING a recording that is
+	 * still running (first spool write error, dropped samples, a gap).
+	 *
+	 * `isRecording` is deliberately NOT touched: the server keeps this message type
+	 * distinct from `recording_status` precisely so a warning is never mistaken for a
+	 * state transition, and mirroring that here keeps one owner for the flag.
+	 */
+	_handleRecordingWarning(msg) {
+		console.warn('EMGClient: recording warning -', msg.message || '');
+		for (const cb of this.onRecordingWarningCallbacks) {
+			cb({ recording: msg.recording, message: msg.message });
 		}
 	}
 

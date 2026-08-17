@@ -126,6 +126,10 @@ export default class App {
 		// connect() so it sees the very first connect/disconnect.
 		this.statusBanner = new StatusBanner(this.emgClient);
 
+		// A recording that is still running but has faulted (spool write error, dropped
+		// samples) — warning tier, so it never masks a stimulation alarm.
+		this.emgClient.onRecordingWarning((w) => this.statusBanner.recordingWarning(w.message));
+
 		// Initialize EMG channel visualization
 		this.emgChannelView = new EMGChannelView(this.emgClient);
 

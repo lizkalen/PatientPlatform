@@ -14,6 +14,8 @@
  *      away. "No alarm on screen" is therefore a statement about the stimulator.
  *   2. Connection — connecting / disconnected while the socket is down.
  *   3. Device lost — the acquisition device dropped out (`device_status`).
+ *   4. Recording warning — a fault during a recording that is still running
+ *      (`recording_warning`), carrying the server's own text.
  *
  * Alarms are raised here by `raiseAlarm()` (wired from the stim drivers in App.js)
  * and directly from `stimulation_status`.
@@ -28,6 +30,7 @@ export default class StatusBanner {
 		this._connected = !!emgClient?.isConnected;
 		this._everConnected = this._connected;
 		this._deviceLost = null;     // message while the acquisition device is gone
+		this._recordingWarning = null;   // a fault during a recording that is still running
 
 		this._build();
 
@@ -52,11 +55,28 @@ export default class StatusBanner {
 		this._render();
 	}
 
+	/**
+	 * A fault during a recording that is still running (the server's spool write error).
+	 * WARNING tier, not an alarm: it never outranks a stimulation alarm, because nothing
+	 * here is delivering current to anyone. It carries the server's own text, which names
+	 * the dropped samples / gap.
+	 */
+	recordingWarning(message) {
+		this._recordingWarning = String(message || 'recording fault reported by the server');
+		this._render();
+	}
+
 	/** Operator dismissal. Refused while the condition is still live. */
 	dismissAlarm() {
 		if (!this._alarm?.cleared) return;
 		this._alarm = null;
 		this._render();
+	}
+
+	/** Dismiss whatever is currently on screen (only what is dismissible gets a button). */
+	_dismissCurrent() {
+		if (this._shown === 'alarm') this.dismissAlarm();
+		else if (this._shown === 'recordingWarning') { this._recordingWarning = null; this._render(); }
 	}
 
 	/**
@@ -110,7 +130,7 @@ export default class StatusBanner {
 		this.dismissEl.type = 'button';
 		this.dismissEl.textContent = '✕';
 		this.dismissEl.title = 'Dismiss (only once the condition has cleared)';
-		this.dismissEl.onclick = () => this.dismissAlarm();
+		this.dismissEl.onclick = () => this._dismissCurrent();
 
 		this.el.append(this.dotEl, this.textEl, this.dismissEl);
 		document.body.appendChild(this.el);
@@ -120,6 +140,7 @@ export default class StatusBanner {
 	_resolve() {
 		if (this._alarm) {
 			return {
+				source: 'alarm',
 				kind: 'alarm',
 				text: this._alarm.cleared
 					? `${this._alarm.message}  ·  condition cleared — click ✕ to dismiss`
@@ -137,13 +158,22 @@ export default class StatusBanner {
 			};
 		}
 		if (this._deviceLost) {
-			return { kind: 'warn', text: `DEVICE LOST — ${this._deviceLost}`, dismissible: false };
+			return { source: 'device', kind: 'warn', text: `DEVICE LOST — ${this._deviceLost}`, dismissible: false };
+		}
+		if (this._recordingWarning) {
+			return {
+				source: 'recordingWarning',
+				kind: 'warn',
+				text: `RECORDING WARNING — ${this._recordingWarning}`,
+				dismissible: true,
+			};
 		}
 		return null;
 	}
 
 	_render() {
 		const s = this._resolve();
+		this._shown = s?.source || null;
 		this.el.className = s ? `status-banner status-banner--${s.kind}` : 'status-banner';
 		if (!s) return;
 		this.el.setAttribute('aria-live', s.kind === 'alarm' ? 'assertive' : 'polite');
