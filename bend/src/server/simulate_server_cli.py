@@ -7,7 +7,11 @@ Usage:
 
 import asyncio
 import typer
-from typing import Annotated
+from typing import Annotated, Optional
+
+# Imported at module scope (unlike the server itself, which stays lazy) because
+# typer evaluates option defaults at decoration time.
+from server.stim_authority import DEFAULT_MAX_TRAIN_SECONDS
 
 app = typer.Typer(help="Simulated EMG WebSocket server (plays back .npz files)")
 
@@ -67,6 +71,18 @@ def main(
         "--notch",
         help="Notch filter frequency (Hz)"
     ),
+    stim_controller_url: Optional[str] = typer.Option(
+        None,
+        "--stim-controller-url",
+        help="Stimulator controller base URL (default http://127.0.0.1:11051). "
+             "Server-side only: a controller_url sent by a client is ignored."
+    ),
+    stim_max_seconds: float = typer.Option(
+        DEFAULT_MAX_TRAIN_SECONDS,
+        "--stim-max-seconds",
+        help="Dead-man deadline for one stimulation train (s). A backstop against "
+             "a stranded train, NOT a therapy parameter — see stim_authority.py."
+    ),
 ):
     """
     Start a simulated WebSocket server that plays back EMG data from an .npz file.
@@ -96,6 +112,8 @@ def main(
         filter_lowcut=lowcut,
         filter_highcut=highcut,
         filter_notch=notch,
+        stim_controller_url=stim_controller_url,
+        stim_max_seconds=stim_max_seconds,
     )
 
     try:

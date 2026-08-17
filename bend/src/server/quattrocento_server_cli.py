@@ -18,6 +18,10 @@ from typing import Optional
 
 import typer
 
+# Imported at module scope (unlike the server itself, which stays lazy) because
+# typer evaluates option defaults at decoration time.
+from server.stim_authority import DEFAULT_MAX_TRAIN_SECONDS
+
 app = typer.Typer(help="Quattrocento (OTBioLab+) + WebSocket server")
 
 
@@ -95,6 +99,16 @@ def main(
     lowcut: float = typer.Option(20.0, "--lowcut", help="Bandpass low cutoff (Hz)"),
     highcut: float = typer.Option(500.0, "--highcut", help="Bandpass high cutoff (Hz)"),
     notch: float = typer.Option(50.0, "--notch", help="Notch frequency (Hz)"),
+    stim_controller_url: Optional[str] = typer.Option(
+        None, "--stim-controller-url",
+        help="Stimulator controller base URL (default http://127.0.0.1:11051). "
+             "Server-side only: a controller_url sent by a client is ignored."
+    ),
+    stim_max_seconds: float = typer.Option(
+        DEFAULT_MAX_TRAIN_SECONDS, "--stim-max-seconds",
+        help="Dead-man deadline for one stimulation train (s). A backstop against "
+             "a stranded train, NOT a therapy parameter — see stim_authority.py."
+    ),
 ):
     """Start the Quattrocento (OTBioLab+) + WebSocket server."""
     from server.websocket_server import RippleWebSocketServer
@@ -187,6 +201,8 @@ def main(
         lsl_source_id="Quattrocento",
         lsl_name="Quattrocento",
         config_loader=config_loader,
+        stim_controller_url=stim_controller_url,
+        stim_max_seconds=stim_max_seconds,
     )
 
     try:
