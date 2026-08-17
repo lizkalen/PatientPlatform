@@ -4,7 +4,23 @@
 listing. Deduplication is a side effect, not the objective. Every package should have one
 obvious home, and the name on the folder should say what is inside it.
 
-**Status:** Phase 0 complete (`0145aeb`). Phases A–G below are outstanding.
+**Status (2026-08-17):** Phases 0–D are complete in the working tree, including the
+"optional, deliberately deferred" `devices/` subpackage (`ripple.py` / `quattrocento.py` /
+`simulated.py`), and the `.bat` launchers now use `python -m server.*`. The history
+containing `0145aeb` was lost when the platform was copied into this repository; the tree
+was re-imported wholesale as `0ed49db`. Deviations from the plan as written: the six
+Phase-C orphans were kept as `src/legacy_server/` instead of deleted, and
+`otb_realtime_plot.py` landed in `src/legacy_pipeline/` instead of `tools/`.
+
+**Still outstanding:** Phase E (`bend/tools/` — `test_decomp_ws.py` is still at the bend
+root, `bt_open_close.py` still in `src/exo/`), Phase F (`bend/README.md` is still 0 bytes,
+no `muniverse/README.md` vendor marker, `decompose_muap` not yet lifted), Phase G
+(verification — note the offline half is blocked: `processing/` was never copied into this
+repository).
+
+**See also:** `docs/ARCHITECTURE_AUDIT.md` for the cross-process findings this plan does
+not cover (stimulation ownership, process lifecycle, the simulated-server fork). Its
+priority stack supersedes the ordering here for anything touching `src/server/`.
 
 ---
 

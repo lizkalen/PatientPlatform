@@ -5,8 +5,17 @@ unattended. The deliverable of this module is *EMG recordings and stimulation ev
 are correct, complete, and traceable*. Everything else — the 3D hand, the timeline, the
 panels — exists to serve that. Where UI and data integrity conflict, data integrity wins.
 
-**Status:** not started. Phase 0 is ~1 hour and should be done before the next recording
-session, because its cost is retroactive.
+**Status (2026-08-17):** Phase 0 is complete — `package.json`, `index.html`, the
+provenance defines in `vite.config.js`, and `_buildTrialMetadata` are all done (note the
+stamped `GIT_SHA` only became meaningful with commit `0ed49db`, when the tree first
+entered version control). Phases A–H are outstanding; A1 (`emergencyStop` not terminal)
+and A4 (`skipToNext` doesn't stop stim) were re-verified live in the source at audit time.
+
+**Read `docs/ARCHITECTURE_AUDIT.md` before starting Phase A.** Its conclusion: Phase A's
+guarantees cannot be anchored in the browser — a crashed tab runs no JavaScript, and the
+server currently stops stimulation on no teardown path whatsoever (audit S2). Phase A
+remains necessary as the operator-facing layer, but it lands together with the
+server-side stimulation authority described in audit S8, not instead of it.
 
 ---
 

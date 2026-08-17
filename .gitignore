@@ -1,0 +1,9 @@
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Created at repo root by the .bat launchers
+/output/
+
+# Simulation input data (EMG recordings — never commit subject data)
+/sim/
