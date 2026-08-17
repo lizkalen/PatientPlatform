@@ -20,7 +20,6 @@ Usage:
 import asyncio
 import json
 import numpy as np
-import pickle as pkl
 import os
 from datetime import datetime
 from collections import deque
@@ -47,6 +46,10 @@ from server.movement_classifier_manager import MovementClassifierManager
 from server.movement_training import MovementTrainer
 from server.stimulation_client import StimulationClient
 from server.stim_authority import StimAuthority, DEFAULT_MAX_TRAIN_SECONDS
+from server.recover_recording import (
+    SPOOL_KIND, SPOOL_LAYOUT, SPOOL_SUFFIX, build_recording_payload, load_spool,
+    safe_name, sidecar_path, unique_path, write_pickle_atomic, write_sidecar,
+)
 
 
 CLOCK_RATE = 30_000  # Match Ripple's clock rate for time conversion
@@ -73,13 +76,25 @@ class DecompositionRecordingState:
 
 @dataclass
 class RecordingState:
-    """Tracks the current recording state."""
+    """Tracks the current recording state.
+
+    Samples are NOT held here; they go straight to an on-disk spool as they
+    arrive (audit P5). Mirrors RippleWebSocketServer.RecordingState — see
+    `server/recover_recording.py` for the shared spool format.
+    """
     is_recording: bool = False
-    pre_trigger_data: Optional[np.ndarray] = None
-    recorded_chunks: list = field(default_factory=list)
     start_time: Optional[datetime] = None
     metadata: Optional[dict] = None
     decomp: DecompositionRecordingState = field(default_factory=DecompositionRecordingState)
+    # Spool state
+    spool_path: Optional[str] = None
+    spool_file: Optional[object] = None      # open binary writer, 1 MB buffered
+    spool_samples: int = 0                   # samples written, pre-trigger included
+    spool_dtype: Optional[str] = None        # pinned at the first write
+    pre_trigger_samples: int = 0
+    spool_write_errors: int = 0
+    spool_dropped_samples: int = 0
+    spool_last_error: Optional[str] = None
 
 
 class SimulatedWebSocketServer:
@@ -331,6 +346,16 @@ class SimulatedWebSocketServer:
                 await self.stim.on_client_disconnect(websocket, len(self.clients))
             except Exception as e:
                 print(f"[SimServer] stim stop-on-disconnect failed: {e}")
+            # A recording nobody is connected to can never be stopped by anyone
+            # (audit P5). The samples are already spooled, so finalising here
+            # only costs the reassembly.
+            if not self.clients and self.recording.is_recording:
+                print("[SimServer] last client disconnected while recording — "
+                      "finalising the recording")
+                try:
+                    await self.stop_recording(None)
+                except Exception as e:
+                    print(f"[SimServer] finalise on last disconnect failed: {e}")
 
     async def handle_message(self, message: str, websocket: websockets.WebSocketServerProtocol):
         """Process incoming messages from clients."""
@@ -412,9 +437,19 @@ class SimulatedWebSocketServer:
 
             # ── movement-model training flow (record raw -> train -> calibrate) ──
             elif command == "mv_record_start":
-                self._mv_raw = []
-                self._mv_capturing = True
-                await self.broadcast({"type": "mv_train_status", "state": "recording"})
+                if self._mv_capturing:
+                    # Audit P5: a duplicate start used to silently discard the
+                    # block already being captured. Refuse instead.
+                    await websocket.send(json.dumps({
+                        "type": "mv_train_status", "state": "error",
+                        "message": ("a movement capture is already in progress "
+                                    f"({len(self._mv_raw)} chunks); stop it with "
+                                    "mv_record_stop before starting another")}))
+                else:
+                    self._mv_raw = []
+                    self._mv_capturing = True
+                    await self.broadcast({"type": "mv_train_status",
+                                          "state": "recording"})
 
             elif command == "mv_record_stop":
                 self._mv_capturing = False
@@ -629,6 +664,160 @@ class SimulatedWebSocketServer:
             await self.broadcast({"type": "mv_train_status", "state": "error",
                                   "message": str(e)})
 
+    # ── recording spool (audit P5) ───────────────────────────────────────────
+    # Mirrors RippleWebSocketServer's spool helpers. Kept as a parallel copy
+    # rather than shared, because collapsing this fork is its own work package;
+    # the FORMAT is shared (server/recover_recording.py), so the recovery tool
+    # and the file layout cannot drift even while these methods do.
+
+    def _recording_base_name(self, metadata: Optional[dict]) -> str:
+        """`emg_recording_<subject>_<session>_<start-ts>`."""
+        meta = metadata or {}
+        subject = safe_name(meta.get("subjectId") or meta.get("subject"), "subject")
+        session = safe_name(meta.get("sessionId") or meta.get("session"), "session")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"emg_recording_{subject}_{session}_{ts}"
+
+    def _spool_sidecar_info(self) -> dict:
+        """Everything needed to interpret the spool, plus the recording metadata."""
+        rec = self.recording
+        info = {
+            "kind": SPOOL_KIND,
+            "spool_file": os.path.basename(rec.spool_path or ""),
+            "n_channels": self.n_channels,
+            "dtype": rec.spool_dtype,
+            "layout": SPOOL_LAYOUT,
+            "srate": self.sample_rate,
+            "filtered": self.enable_filtering,
+            "pre_trigger_seconds": self.pre_trigger_seconds,
+            "pre_trigger_samples": rec.pre_trigger_samples,
+            "n_samples": rec.spool_samples,
+            "stream_type": "simulated",
+            "trial_metadata": rec.metadata,
+            "started": rec.start_time.strftime("%Y%m%d_%H%M%S") if rec.start_time else None,
+        }
+        if rec.spool_write_errors:
+            info["spool_write_errors"] = {
+                "count": rec.spool_write_errors,
+                "dropped_samples": rec.spool_dropped_samples,
+                "last_error": rec.spool_last_error,
+            }
+        return info
+
+    def _open_spool(self, metadata: Optional[dict]) -> bool:
+        """Open the spool and write its sidecar AT START. False if the disk said no."""
+        rec = self.recording
+        path = os.path.join(self.output_folder,
+                            self._recording_base_name(metadata) + SPOOL_SUFFIX)
+        try:
+            rec.spool_path = unique_path(path)
+            rec.spool_file = open(rec.spool_path, "wb", buffering=1 << 20)
+            rec.spool_samples = 0
+            rec.spool_dtype = None
+            write_sidecar(rec.spool_path, self._spool_sidecar_info())
+            print(f"  Spool: {os.path.basename(rec.spool_path)} (incremental, "
+                  f"crash-safe)")
+            return True
+        except Exception as e:
+            print(f"[Recording] could not open the recording spool: {e}")
+            try:
+                if rec.spool_file is not None:
+                    rec.spool_file.close()
+            except Exception:
+                pass
+            rec.spool_file = None
+            rec.spool_path = None
+            return False
+
+    def _spool_write(self, samples) -> bool:
+        """Append one channels-major chunk to the spool. Never raises."""
+        rec = self.recording
+        writer = rec.spool_file
+        if writer is None:
+            return False
+        try:
+            if rec.spool_dtype is None:
+                rec.spool_dtype = str(samples.dtype)
+                write_sidecar(rec.spool_path, self._spool_sidecar_info())
+            writer.write(np.ascontiguousarray(samples.T, dtype=rec.spool_dtype).tobytes())
+            # Flush (not fsync) per chunk: a flushed write survives process
+            # death, which is the failure the spool exists for. See the live
+            # server's _spool_write for the full reasoning.
+            writer.flush()
+            rec.spool_samples += int(samples.shape[1])
+            return True
+        except Exception as e:
+            rec.spool_write_errors += 1
+            rec.spool_dropped_samples += int(getattr(samples, "shape", (0, 0))[1] or 0)
+            rec.spool_last_error = str(e)
+            if rec.spool_write_errors == 1:
+                print(f"[Recording] *** SPOOL WRITE FAILED: {e} — the recording "
+                      f"now has a gap. Further failures are counted and reported "
+                      f"with the saved file. ***")
+            return False
+
+    def _close_spool(self):
+        """Flush and close the spool. Returns (path, sidecar info) or (None, None)."""
+        rec = self.recording
+        writer, path = rec.spool_file, rec.spool_path
+        rec.spool_file = None
+        if writer is None:
+            return None, None
+        try:
+            writer.flush()
+            os.fsync(writer.fileno())
+        except Exception as e:
+            print(f"[Recording] could not flush the spool: {e}")
+        try:
+            writer.close()
+        except Exception:
+            pass
+        info = self._spool_sidecar_info()
+        try:
+            write_sidecar(path, info)
+        except Exception as e:
+            print(f"[Recording] could not update the spool sidecar: {e}")
+        return path, info
+
+    @staticmethod
+    def _discard_spool(path: Optional[str]):
+        """Remove a spool and its sidecar. Only ever called once the .pkl exists."""
+        for target in (path, sidecar_path(path) if path else None):
+            if not target:
+                continue
+            try:
+                os.remove(target)
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                print(f"[Recording] could not remove {os.path.basename(target)}: {e}")
+
+    @staticmethod
+    def _finalize_recording(spool_path, info, out_path, timeline, decomposition,
+                            timestamp):
+        """Reassemble the spool and write the final .pkl. Runs in a worker thread."""
+        data = load_spool(spool_path, info)
+        payload = build_recording_payload(data, info, timestamp=timestamp,
+                                          timeline=timeline,
+                                          decomposition=decomposition)
+        written = write_pickle_atomic(payload, unique_path(out_path))
+        return written, int(data.shape[1])
+
+    def _reset_recording_state(self):
+        """Return to idle. Called from a `finally` on EVERY stop path (audit P5)."""
+        rec = self.recording
+        rec.start_time = None
+        rec.metadata = None
+        rec.decomp = DecompositionRecordingState()
+        rec.spool_path = None
+        rec.spool_file = None
+        rec.spool_samples = 0
+        rec.spool_dtype = None
+        rec.pre_trigger_samples = 0
+        rec.spool_write_errors = 0
+        rec.spool_dropped_samples = 0
+        rec.spool_last_error = None
+
     async def start_recording(self, metadata: Optional[dict] = None):
         """Start recording, capturing the pre-trigger buffer."""
         if self.recording.is_recording:
@@ -638,17 +827,35 @@ class SimulatedWebSocketServer:
             })
             return
 
+        # Pre-trigger snapshot, unchanged: taken before anything else.
+        pre_trigger = None
         if self.rolling_buffer:
             buffer_list = list(self.rolling_buffer)
             if buffer_list:
-                self.recording.pre_trigger_data = np.array(buffer_list).T
-            else:
-                self.recording.pre_trigger_data = None
+                pre_trigger = np.array(buffer_list).T
 
-        self.recording.is_recording = True
-        self.recording.recorded_chunks = []
         self.recording.start_time = datetime.now()
         self.recording.metadata = metadata
+        self.recording.spool_write_errors = 0
+        self.recording.spool_dropped_samples = 0
+        self.recording.spool_last_error = None
+        self.recording.pre_trigger_samples = 0
+
+        if not self._open_spool(metadata):
+            self._reset_recording_state()
+            await self.broadcast({
+                "type": "error",
+                "message": ("Cannot start recording: the recording spool could not "
+                            "be opened (check the output folder and free disk "
+                            "space). Nothing was recorded."),
+            })
+            return
+
+        # The pre-trigger goes in first, as part of the same stream.
+        if pre_trigger is not None:
+            self._spool_write(pre_trigger)
+            self.recording.pre_trigger_samples = int(pre_trigger.shape[1])
+        pre_trigger = None                    # released: the spool is the only copy
 
         # Initialize decomposition recording with current config snapshot
         decomp_config = None
@@ -673,8 +880,12 @@ class SimulatedWebSocketServer:
             print(f"Recording started with metadata: subject={metadata.get('subjectId')}, session={metadata.get('sessionId')}")
 
         pre_duration = 0
-        if self.recording.pre_trigger_data is not None:
-            pre_duration = self.recording.pre_trigger_data.shape[1] / self.sample_rate
+        if self.recording.pre_trigger_samples and self.sample_rate:
+            pre_duration = self.recording.pre_trigger_samples / self.sample_rate
+
+        # Set last: the stream loop spools on this flag, and the pre-trigger must
+        # already be in the file before any live chunk lands behind it.
+        self.recording.is_recording = True
 
         print(f"Recording started (pre-trigger: {pre_duration:.1f}s)"
               f"{' + decomposition' if self.decomp.active else ''}")
@@ -685,8 +896,38 @@ class SimulatedWebSocketServer:
             "message": f"Recording started with {pre_duration:.1f}s pre-trigger data"
         })
 
+    def _decomposition_payload(self):
+        """The `decomposition` block for the saved file, or None if none ran."""
+        dr = self.recording.decomp
+        if not dr.firing_rates:
+            return None
+        movement_timeline = self._build_movement_timeline(
+            dr.classification_events, self.sample_rate)
+        payload = {
+            "config": dr.config,
+            "firing_rates": np.array(dr.firing_rates),       # (n_chunks, n_mus)
+            "sil_scores": np.array(dr.sil_scores),           # (n_chunks, n_mus)
+            "sources": dr.sources,                            # list of (n_mus, n_samples) arrays
+            "spikes": dr.spikes,                              # list of {mu_idx: array} dicts
+            "classification_events": dr.classification_events, # list of event dicts
+            "movement_timeline": movement_timeline,           # REST/HOLD periods
+            "n_chunks": len(dr.firing_rates),
+        }
+        print(f"  Decomposition: {len(dr.firing_rates)} chunks, "
+              f"{len(dr.classification_events)} classification events, "
+              f"{len(movement_timeline)} movement periods")
+        for period in movement_timeline:
+            print(f"    {period['state']:>5s} (label {period['label']}) "
+                  f"{period['start_sec']:.2f}s - {period['end_sec']:.2f}s "
+                  f"({period['duration_sec']:.2f}s)")
+        return payload
+
     async def stop_recording(self, timeline: Optional[dict] = None):
-        """Stop recording and save the data.
+        """Stop recording, reassemble the spool and save the .pkl.
+
+        Mirrors RippleWebSocketServer.stop_recording: reassembly happens in a
+        worker thread (audit P6), and a failed save keeps the spool instead of
+        destroying it (audit P5).
 
         Args:
             timeline: Optional session timeline with phase events from frontend
@@ -699,94 +940,71 @@ class SimulatedWebSocketServer:
             return
 
         self.recording.is_recording = False
+        spool_path, info = self._close_spool()
 
-        all_chunks = []
-        if self.recording.pre_trigger_data is not None:
-            all_chunks.append(self.recording.pre_trigger_data)
+        try:
+            if not spool_path or not info or not info.get("n_samples"):
+                await self.broadcast({
+                    "type": "error",
+                    "message": "No data was recorded"
+                })
+                self._discard_spool(spool_path)     # empty: nothing to preserve
+                return
 
-        if self.recording.recorded_chunks:
-            recorded_data = np.hstack(self.recording.recorded_chunks)
-            all_chunks.append(recorded_data)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            suffix = "_classif" if self.recording.decomp.classification_events else ""
+            base = os.path.basename(spool_path)
+            if base.endswith(SPOOL_SUFFIX):
+                base = base[:-len(SPOOL_SUFFIX)]
+            out_path = os.path.join(self.output_folder, f"{base}{suffix}.pkl")
+            decomposition = self._decomposition_payload()
 
-        if not all_chunks:
+            try:
+                filepath, n_samples = await asyncio.to_thread(
+                    self._finalize_recording, spool_path, info, out_path,
+                    timeline, decomposition, timestamp)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"[Recording] *** SAVE FAILED: {e} — the spool is KEPT at "
+                      f"{spool_path} ***")
+                await self.broadcast({
+                    "type": "recording_status",
+                    "recording": False,
+                    "message": "Recording stopped, but SAVING FAILED — the raw "
+                               "data is safe in the spool file",
+                })
+                await self.broadcast({
+                    "type": "error",
+                    "message": (f"Failed to save the recording: {e}. The raw data "
+                                f"is intact at {spool_path} — recover it with: "
+                                f"python -m server.recover_recording "
+                                f"\"{spool_path}\""),
+                })
+                return
+
+            duration = n_samples / self.sample_rate if self.sample_rate else 0.0
+            print(f"\n  Recording saved to: {os.path.abspath(filepath)}")
+            print(f"  Duration: {duration:.1f}s, Channels: {self.n_channels}")
+
+            # Durably written: only now may the spool go.
+            self._discard_spool(spool_path)
+
             await self.broadcast({
-                "type": "error",
-                "message": "No data was recorded"
+                "type": "recording_status",
+                "recording": False,
+                "message": "Recording stopped and saved"
             })
-            return
 
-        full_recording = np.hstack(all_chunks)
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        has_classif = bool(self.recording.decomp.classification_events)
-        suffix = "_classif" if has_classif else ""
-        filename = f"emg_recording_{timestamp}{suffix}.pkl"
-        filepath = os.path.join(self.output_folder, filename)
-
-        recording_data = {
-            "data": full_recording,
-            "srate": self.sample_rate,
-            "n_channels": self.n_channels,
-            "filtered": self.enable_filtering,
-            "pre_trigger_seconds": self.pre_trigger_seconds,
-            "timestamp": timestamp,
-            "stream_type": "simulated",
-            "trial_metadata": self.recording.metadata,
-            "session_timeline": timeline,
-        }
-
-        # Add decomposition data if any was recorded
-        dr = self.recording.decomp
-        if dr.firing_rates:
-            # Build movement timeline: list of {state, label, start_sec, end_sec, duration_sec}
-            movement_timeline = self._build_movement_timeline(dr.classification_events, self.sample_rate)
-
-            recording_data["decomposition"] = {
-                "config": dr.config,
-                "firing_rates": np.array(dr.firing_rates),       # (n_chunks, n_mus)
-                "sil_scores": np.array(dr.sil_scores),           # (n_chunks, n_mus)
-                "sources": dr.sources,                            # list of (n_mus, n_samples) arrays
-                "spikes": dr.spikes,                              # list of {mu_idx: array} dicts
-                "classification_events": dr.classification_events, # list of event dicts
-                "movement_timeline": movement_timeline,           # REST/HOLD periods
-                "n_chunks": len(dr.firing_rates),
-            }
-            n_class_events = len(dr.classification_events)
-            print(f"  Decomposition: {len(dr.firing_rates)} chunks, "
-                  f"{n_class_events} classification events, "
-                  f"{len(movement_timeline)} movement periods")
-            for period in movement_timeline:
-                print(f"    {period['state']:>5s} (label {period['label']}) "
-                      f"{period['start_sec']:.2f}s - {period['end_sec']:.2f}s "
-                      f"({period['duration_sec']:.2f}s)")
-
-        abs_filepath = os.path.abspath(filepath)
-        with open(filepath, "wb") as f:
-            pkl.dump(recording_data, f)
-
-        duration = full_recording.shape[1] / self.sample_rate
-        print(f"\n  Recording saved to: {abs_filepath}")
-        print(f"  Duration: {duration:.1f}s, Channels: {self.n_channels}")
-
-        await self.broadcast({
-            "type": "recording_status",
-            "recording": False,
-            "message": "Recording stopped and saved"
-        })
-
-        await self.broadcast({
-            "type": "recording_saved",
-            "filepath": filepath,
-            "duration_seconds": duration,
-            "n_channels": self.n_channels,
-            "n_samples": full_recording.shape[1]
-        })
-
-        self.recording.pre_trigger_data = None
-        self.recording.recorded_chunks = []
-        self.recording.start_time = None
-        self.recording.metadata = None
-        self.recording.decomp = DecompositionRecordingState()
+            await self.broadcast({
+                "type": "recording_saved",
+                "filepath": filepath,
+                "duration_seconds": duration,
+                "n_channels": self.n_channels,
+                "n_samples": n_samples
+            })
+        finally:
+            self._reset_recording_state()
 
     async def stream_data(self):
         """Continuously read from simulated device and broadcast to clients."""
@@ -857,9 +1075,9 @@ class SimulatedWebSocketServer:
                 for i in range(n_new):
                     self.rolling_buffer.append(samples[:, i])
 
-                # If recording, store in recorded chunks
+                # If recording, append straight to the on-disk spool (audit P5).
                 if self.recording.is_recording:
-                    self.recording.recorded_chunks.append(samples.copy())
+                    self._spool_write(samples)
 
                 # Broadcast EMG to WebSocket clients
                 timestamp = self._sim2lsl(ts) if ts else None
@@ -974,60 +1192,26 @@ class SimulatedWebSocketServer:
         print("[Teardown] done.")
 
     async def _flush_recording_for_teardown(self):
-        """Save whatever a running recording captured, instead of dropping it.
+        """Finalise a running recording instead of dropping it.
 
         Also covers the sim-only path where playback simply ends (audit P5: the
         sim server used to drop an active recording wordlessly), because that
-        exits stream_data() and lands in run()'s finally.
+        exits stream_data() and lands in run()'s finally. The samples are
+        already spooled, so this only reassembles them; if that fails,
+        stop_recording keeps the spool and prints the recovery command.
         """
         if not self.recording.is_recording:
             return
-        print("[Teardown] a recording is still running — flushing it to disk")
+        spool_path = self.recording.spool_path
+        print("[Teardown] a recording is still running — finalising it")
         try:
             await self.stop_recording(None)
-            return
         except Exception as e:
             import traceback
-            print(f"[Teardown] normal recording save FAILED ({e}); "
-                  f"falling back to an emergency dump")
             traceback.print_exc()
-        try:
-            await asyncio.to_thread(self._emergency_dump_recording)
-        except Exception as e:
-            print(f"[Teardown] EMERGENCY DUMP FAILED: {e} — the recording is lost")
-
-    def _emergency_dump_recording(self):
-        """Last-resort write of an in-progress recording (blocking; use to_thread).
-
-        Chunks are pickled as a LIST, not hstacked: hstack is a plausible cause
-        of the failure that got us here and doubles peak RSS. Reassemble on load
-        with np.hstack([pre_trigger_data] + recorded_chunks).
-        """
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(self.output_folder, f"emg_recording_EMERGENCY_{ts}.pkl")
-        payload = {
-            "kind": "emergency_teardown_dump",
-            "note": "backend shut down mid-recording; chunks are NOT concatenated: "
-                    "np.hstack([pre_trigger_data] + recorded_chunks)",
-            "pre_trigger_data": self.recording.pre_trigger_data,
-            "recorded_chunks": self.recording.recorded_chunks,
-            "srate": self.sample_rate,
-            "n_channels": self.n_channels,
-            "filtered": self.enable_filtering,
-            "pre_trigger_seconds": self.pre_trigger_seconds,
-            "timestamp": ts,
-            "stream_type": "simulated",
-            "trial_metadata": self.recording.metadata,
-        }
-        try:
-            with open(path, "wb") as f:
-                pkl.dump(payload, f)
-        except Exception as e:
-            print(f"[Teardown] emergency dump failed ({e}); retrying without metadata")
-            payload["trial_metadata"] = repr(self.recording.metadata)[:2000]
-            with open(path, "wb") as f:
-                pkl.dump(payload, f)
-        print(f"[Teardown] emergency dump written: {os.path.abspath(path)}")
+            print(f"[Teardown] finalising the recording FAILED ({e}). The raw data "
+                  f"is intact at {spool_path} — recover it with: "
+                  f"python -m server.recover_recording \"{spool_path}\"")
 
     async def run(self):
         """Start the server and data streaming."""
