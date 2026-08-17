@@ -81,9 +81,16 @@ export default class MovementSessionController {
 		// Redundant hard stop for a sensor-pass train. The intended stop is a single
 		// setTimeout armed on the leave-MOVE transition; if that transition never
 		// arrives (player stalled, config swapped, socket dropped) nothing else turns
-		// the train off. This fires at the longest legitimate bout + the configured
-		// hold, i.e. slightly after any real train should already have ended.
+		// the train off. The deadline is derived per bout from the cued clip's own
+		// duration (see _armHardStop) — this value is only the FALLBACK for when that
+		// duration cannot be read. It must not act as a ceiling: movement segments of
+		// 12-14 s are normal (plan E2), so a fixed 15 s cap would false-positive into a
+		// terminal halt on a legitimately long bout.
 		this.maxTimedStimMs = options.maxTimedStimMs ?? 15000;
+		// Margin added to a derived deadline, and the cadence for retrying a stop that
+		// failed to send.
+		this.hardStopMarginMs = options.hardStopMarginMs ?? 2000;
+		this.stopRetryMs = options.stopRetryMs ?? 2000;
 		this._sessionConfig = null;                 // the live config captured at session start
 		this.montage = { perGrid: 64, nGrids: 3 };  // EMG grid layout (drives good-mask + features)
 		this.deviceInfo = '';                       // device/channel feedback for the UI
@@ -723,16 +730,43 @@ export default class MovementSessionController {
 	 * ended this train is not working, so the very next MOVE phase would arm another
 	 * one. It therefore halts the whole session (same terminal latch as the operator's
 	 * emergency stop) rather than just cutting this train — re-arming needs reset().
+	 *
+	 * Because the consequence is terminal, the deadline is derived from THIS bout's
+	 * planned duration rather than a fixed cap: we schedule the real stop ourselves, so
+	 * we know when it is due. `maxTimedStimMs` is only the fallback for a bout whose
+	 * clip duration cannot be read.
 	 */
 	_armHardStop() {
 		this._clearHardStopTimer();
+		const deadline = this._hardStopDeadlineMs();
 		this._hardStopTimer = setTimeout(() => {
 			this._hardStopTimer = null;
 			if (!this._sensorStimOn) return;
-			this._raiseAlarm(`STIM WATCHDOG — timed train ran past ${this.maxTimedStimMs
-				+ this.postStimHoldMs} ms. Stop forced and the session HALTED; reset to continue.`);
+			this._raiseAlarm(`STIM WATCHDOG — timed train ran past its ${deadline} ms deadline. `
+				+ 'Stop forced and the session HALTED; reset to continue.');
 			this.emergencyStop();
-		}, this.maxTimedStimMs + this.postStimHoldMs);
+		}, deadline);
+	}
+
+	/**
+	 * When the train started now is due to end, plus a margin. The bout runs from the
+	 * pre-stim delay to the end of the movement, then `postStimHoldMs`; the movement's
+	 * length is the cued clip's duration at the configured playback speed, extended by
+	 * the slowest segment multiplier in play (segments can deliberately slow a clip
+	 * down, and under-estimating here would halt a healthy session).
+	 */
+	_hardStopDeadlineMs() {
+		const margin = this.hardStopMarginMs + this.postStimHoldMs;
+		const wv = this.player?.webglView;
+		const clipSec = wv?.animationDuration;
+		if (!(clipSec > 0)) return this.maxTimedStimMs + margin;   // duration unknown
+		const speed = wv.playbackSpeed > 0 ? wv.playbackSpeed : 1;
+		const mults = Object.values(wv.segmentManager?.speeds || {}).filter((n) => n > 0);
+		const slowest = Math.min(1, ...(mults.length ? mults : [1]));
+		const moveMs = (clipSec / speed / slowest) * 1000;
+		// The pre-stim delay has already elapsed when this is armed, so only the rest of
+		// the movement is still to come.
+		return Math.max(0, moveMs - this.preStimDelayMs) + margin;
 	}
 
 	/**
@@ -747,18 +781,37 @@ export default class MovementSessionController {
 	 * @returns {boolean} whether the command left the socket
 	 */
 	_stopTimedStim({ force = false } = {}) {
-		this._clearHardStopTimer();
-		if (!force && !this._sensorStimOn && !this._pendingStimStop) return true;
+		if (!force && !this._sensorStimOn && !this._pendingStimStop) {
+			this._clearHardStopTimer();
+			return true;
+		}
 		const { stimCfg } = this._resolvePatterns();
 		const sent = this.client.stimulateStop({ controllerUrl: stimCfg.controllerUrl });
 		if (sent) {
 			this._sensorStimOn = false;
 			this._pendingStimStop = false;
+			this._clearHardStopTimer();
 		} else {
+			// The train is still presumed running: do NOT tear down the timer that is the
+			// only thing bounding it. Re-purpose it as a slow retry until the stop lands
+			// or the socket returns. One alarm per failure episode; retries are silent.
+			const first = !this._pendingStimStop;
 			this._pendingStimStop = true;
-			this._raiseAlarm('STOP NOT SENT — no connection to the server; stimulation may still be running');
+			this._armStopRetry();
+			if (first) {
+				this._raiseAlarm('STOP NOT SENT — no connection to the server; stimulation may still be running');
+			}
 		}
 		return sent;
+	}
+
+	/** Keep chasing a stop that never left the socket (the train is presumed live). */
+	_armStopRetry() {
+		this._clearHardStopTimer();
+		this._hardStopTimer = setTimeout(() => {
+			this._hardStopTimer = null;
+			if (this._pendingStimStop) this._stopTimedStim({ force: true });
+		}, this.stopRetryMs);
 	}
 
 	_clearHardStopTimer() {
