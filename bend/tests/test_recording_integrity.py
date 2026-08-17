@@ -135,10 +135,16 @@ def test_spool_is_written_incrementally_and_nothing_is_kept_in_ram():
         ok(srv.recording.spool_samples == 50,
            f"50 samples spooled, state says {srv.recording.spool_samples}")
 
-        # RAM proxy: no attribute on the recording state holds the samples.
+        # RAM proxy: nothing on the recording state holds sample data. Small
+        # metadata lists are fine (spool_segments is one dict per dtype change);
+        # what must never appear again is an array or a list of them.
         held = [name for name, value in vars(srv.recording).items()
-                if isinstance(value, list) and value]
-        ok(not held, f"no sample list is retained on the recording state ({held})")
+                if isinstance(value, np.ndarray)
+                or (isinstance(value, list)
+                    and any(isinstance(item, np.ndarray) for item in value))]
+        ok(not held, f"no sample array is retained on the recording state ({held})")
+        ok(len(srv.recording.spool_segments) == 1,
+           "and the only list on it is the one-entry segment index")
 
         await srv.stop_recording(None)
 
@@ -563,6 +569,358 @@ def test_sim_server_teardown_saves_an_active_recording():
         arun(lambda: scenario(output))
 
 
+# ── concurrency: a stop that is still finalising (QA H1) ────────────────────
+
+def test_start_during_a_slow_stop_is_not_clobbered():
+    """A recording that starts while an earlier stop is still reassembling.
+
+    `stop_recording` flips `is_recording` and detaches the spool synchronously,
+    then awaits a multi-second reassembly. Its `finally` used to reset the
+    state unconditionally, so it wiped the *second* recording's live spool
+    handle: every later `_spool_write` silently returned False, the second stop
+    reported "No data was recorded" while an orphan sat on disk, and no
+    recording_status ever arrived so the frontend's flag stuck on.
+    """
+    if not HAVE_NUMPY:
+        return _skip("slow-stop race")
+
+    async def scenario(output):
+        srv = _server(output)
+        await srv.start_recording({"subjectId": "first"})
+        srv._spool_write(_chunk(4, 10))
+        first_generation = srv.recording.generation
+
+        # Park the reassembly so a second start lands mid-flight.
+        real_finalize = srv._finalize_recording
+        release = asyncio.Event()
+
+        def slow_finalize(*args, **kwargs):
+            import time
+            while not release.is_set():
+                time.sleep(0.005)
+            return real_finalize(*args, **kwargs)
+
+        srv._finalize_recording = slow_finalize
+        stop_task = asyncio.create_task(srv.stop_recording(None))
+        await asyncio.sleep(0.05)
+        ok(srv.recording.is_recording is False,
+           "the first stop has already flipped is_recording while finalising")
+
+        del srv._finalize_recording                   # the next save is normal
+        await srv.start_recording({"subjectId": "second"})
+        second_generation = srv.recording.generation
+        ok(second_generation > first_generation,
+           f"the second recording gets a new generation "
+           f"({first_generation} -> {second_generation})")
+        second_spool = srv.recording.spool_path
+        ok(srv._spool_write(_chunk(4, 20, start=500)) is True,
+           "the second recording accepts samples")
+
+        release.set()
+        await stop_task
+
+        ok(srv.recording.is_recording is True,
+           "the finished first stop did not stop the second recording")
+        ok(srv.recording.spool_path == second_spool,
+           "it did not null the second recording's spool path")
+        ok(srv.recording.spool_file is not None,
+           "nor its live writer (this is what silently swallowed samples)")
+        ok(srv.recording.metadata == {"subjectId": "second"},
+           "nor its metadata")
+        ok(srv._spool_write(_chunk(4, 5, start=900)) is True,
+           "and writes still land after the first stop completed")
+
+        srv.sent.clear()
+        await srv.stop_recording(None)
+        ok(not [m for m in srv.sent if m.get("type") == "error"],
+           "the second stop reports no error")
+        statuses = [m for m in srv.sent if m.get("type") == "recording_status"]
+        ok(statuses and statuses[-1]["recording"] is False,
+           "and does send recording_status:false, so the UI flag clears")
+
+        files = _pkls(output)
+        ok(len(files) == 2, f"both recordings are on disk ({files})")
+        ok(not _spools(output), "no orphaned spool is left behind")
+        by_subject = {}
+        for name in files:
+            with open(os.path.join(output, name), "rb") as f:
+                saved = pickle.load(f)
+            by_subject[saved["trial_metadata"]["subjectId"]] = saved["data"].shape[1]
+        ok(by_subject.get("first") == 10 and by_subject.get("second") == 25,
+           f"each holds its own samples ({by_subject})")
+
+    with _Workspace() as output:
+        arun(lambda: scenario(output))
+
+
+def test_no_data_recorded_sends_recording_status():
+    """The flag must clear even when there was nothing to save (QA H1)."""
+    if not HAVE_NUMPY:
+        return _skip("empty-recording status")
+
+    async def scenario(output):
+        srv = _server(output)
+        await srv.start_recording(META)
+        srv.sent.clear()
+        await srv.stop_recording(None)
+
+        statuses = [m for m in srv.sent if m.get("type") == "recording_status"]
+        ok(statuses and statuses[-1]["recording"] is False,
+           "recording_status:false is sent so the frontend flag cannot stick")
+
+    with _Workspace() as output:
+        arun(lambda: scenario(output))
+
+
+# ── write failures must be visible in real time (QA H2) ─────────────────────
+
+def test_first_spool_write_error_is_broadcast_and_persisted():
+    """A gap must reach the operator immediately, and survive a crash."""
+    if not HAVE_NUMPY:
+        return _skip("spool error broadcast")
+
+    async def scenario(output):
+        srv = _server(output)
+        await srv.start_recording(META)
+        srv._spool_write(_chunk(4, 10))
+        spool = srv.recording.spool_path
+        srv.sent.clear()
+
+        class BrokenWriter:
+            def write(self, _):
+                raise OSError("disk went away")
+
+        good = srv.recording.spool_file
+        srv.recording.spool_file = BrokenWriter()
+        srv._spool_write(_chunk(4, 10))
+        srv._spool_write(_chunk(4, 10))               # second failure
+        srv.recording.spool_file = good
+        await asyncio.sleep(0)                        # let the warning task run
+
+        warnings = [m for m in srv.sent if m.get("type") == "recording_warning"]
+        ok(len(warnings) == 1,
+           f"exactly one warning is broadcast, on the FIRST error "
+           f"(got {len(warnings)})")
+        ok("LOST" in warnings[0]["message"],
+           "and it says plainly that data is being lost")
+
+        # A crash right now must still disclose the gap: the sidecar is
+        # rewritten on the first error, not only at close.
+        info = rr.read_sidecar(spool)
+        ok(info.get("spool_write_errors", {}).get("count") == 1,
+           "the sidecar on disk already records the error")
+
+        srv.recording.spool_file.close()              # crash
+        srv.recording.is_recording = False
+        recovered = rr.recover(spool)
+        with open(recovered, "rb") as f:
+            saved = pickle.load(f)
+        ok(saved.get("spool_write_errors", {}).get("count") == 1,
+           "so a RECOVERED file carries the gap disclosure too")
+
+    with _Workspace() as output:
+        arun(lambda: scenario(output))
+
+
+# ── dtype must widen, never narrow (QA M2) ──────────────────────────────────
+
+def test_widening_dtype_never_narrows_the_recording():
+    """float32 then float64 must not truncate: the old hstack path promoted."""
+    if not HAVE_NUMPY:
+        return _skip("mixed-dtype recording")
+
+    async def scenario(output):
+        srv = _server(output)
+        await srv.start_recording(META)
+
+        narrow = _chunk(4, 10, dtype="float32")
+        # A value float32 cannot hold exactly, so narrowing is detectable.
+        wide = np.full((4, 10), 1.0 + 2.0 ** -40, dtype="float64")
+
+        srv._spool_write(narrow)
+        srv._spool_write(wide)
+        ok(len(srv.recording.spool_segments) == 2,
+           "the widening chunk opened a second segment instead of being cast down")
+        ok(srv.recording.spool_dtype == "float64", "the pinned dtype widened")
+
+        await srv.stop_recording(None)
+        with open(os.path.join(output, _pkls(output)[0]), "rb") as f:
+            saved = pickle.load(f)
+
+        expected = np.hstack([narrow, wide])
+        ok(saved["data"].dtype == expected.dtype == np.dtype("float64"),
+           f"the saved dtype is the promoted one ({saved['data'].dtype}), "
+           f"exactly as hstack would have produced")
+        ok(np.array_equal(saved["data"], expected),
+           "and the samples are bit-for-bit what hstack would have produced")
+        ok(saved["data"][0, -1] != np.float32(1.0 + 2.0 ** -40),
+           "the wide values kept precision a float32 spool would have lost")
+        ok(not _spools(output) and not [n for n in os.listdir(output)
+                                        if ".spool." in n and not n.endswith(".pkl")],
+           "every segment file is cleaned up after the save")
+
+    with _Workspace() as output:
+        arun(lambda: scenario(output))
+
+
+def test_crash_mid_widening_recovers_every_complete_segment():
+    """Recovery must be correct for a crash at any point, segments included."""
+    if not HAVE_NUMPY:
+        return _skip("segmented crash recovery")
+
+    async def scenario(output):
+        srv = _server(output)
+        await srv.start_recording(META)
+        narrow = _chunk(4, 10, dtype="float32")
+        wide = _chunk(4, 10, start=500, dtype="float64")
+        srv._spool_write(narrow)
+        srv._spool_write(wide)
+        spool = srv.recording.spool_path
+        leaked = srv.recording.spool_file
+        srv.recording.is_recording = False            # crash: no close, no stop
+
+        recovered = rr.recover(spool)
+        with open(recovered, "rb") as f:
+            saved = pickle.load(f)
+        ok(np.array_equal(saved["data"], np.hstack([narrow, wide])),
+           "both segments are recovered and promoted")
+        leaked.close()
+
+        # And a crash in the gap between registering a segment and writing it.
+        srv2 = _server(output)
+        await srv2.start_recording({"subjectId": "gap"})
+        srv2._spool_write(_chunk(4, 10, dtype="float32"))
+        srv2._start_spool_segment(np.dtype("float64"))
+        spool2 = srv2.recording.spool_path
+        leaked2 = srv2.recording.spool_file
+        leaked2.close()
+        os.remove(f"{spool2}.1")                      # never made it to disk
+        srv2.recording.is_recording = False
+
+        recovered2 = rr.recover(spool2)
+        with open(recovered2, "rb") as f:
+            saved2 = pickle.load(f)
+        ok(saved2["data"].shape == (4, 10),
+           f"the complete segment survives a missing one ({saved2['data'].shape})")
+
+    with _Workspace() as output:
+        arun(lambda: scenario(output))
+
+
+# ── recover tool hardening (QA M1/L1/L2) ────────────────────────────────────
+
+def test_recover_warns_about_a_live_spool():
+    """Recovering a spool a server is still writing to must be called out."""
+    if not HAVE_NUMPY:
+        return _skip("liveness warning")
+
+    async def scenario(output):
+        srv = _server(output)
+        await srv.start_recording(META)
+        srv._spool_write(_chunk(4, 10))
+        spool = srv.recording.spool_path
+        info = rr.read_sidecar(spool)
+
+        warnings = rr.liveness_warnings(spool, info, settle_s=0.05)
+        ok(any("written" in w for w in warnings),
+           f"a just-written spool is flagged as possibly live ({warnings})")
+
+        # Growth is detected too.
+        import threading
+        stop = threading.Event()
+
+        def keep_writing():
+            while not stop.is_set():
+                srv._spool_write(_chunk(4, 10))
+                stop.wait(0.01)
+
+        writer = threading.Thread(target=keep_writing, daemon=True)
+        writer.start()
+        try:
+            growing = rr.liveness_warnings(spool, info, settle_s=0.2)
+        finally:
+            stop.set()
+            writer.join(timeout=1)
+        ok(any("GREW" in w for w in growing),
+           f"a growing spool is flagged loudly ({growing})")
+
+        await srv.stop_recording(None)
+
+    with _Workspace() as output:
+        arun(lambda: scenario(output))
+
+
+def test_listing_flags_post_save_debris():
+    """--list must explain a spool sitting next to its finished recording."""
+    if not HAVE_NUMPY:
+        return _skip("listing debris")
+
+    async def scenario(output):
+        srv = _server(output)
+        await srv.start_recording(META)
+        srv._spool_write(_chunk(4, 10))
+        spool = srv.recording.spool_path
+        srv.recording.spool_file.close()
+        srv.recording.is_recording = False
+
+        # The save succeeded, the cleanup did not: final .pkl beside the spool.
+        base = spool[:-len(rr.SPOOL_SUFFIX)]
+        with open(base + ".pkl", "wb") as f:
+            pickle.dump({"data": None}, f)
+        with open(os.path.join(output, "something.pkl.partial"), "wb") as f:
+            f.write(b"half a pickle")
+
+        ok(rr.final_pkl_siblings(spool) == [base + ".pkl"],
+           "the finished recording beside the spool is detected")
+        ok(rr.main(["--list", output]) == 0,
+           "--list runs and reports both the debris and the .partial")
+
+    with _Workspace() as output:
+        arun(lambda: scenario(output))
+
+
+def test_safe_name_is_length_capped():
+    """Long free-text subject/session must not push the path past MAX_PATH."""
+    token = rr.safe_name("x" * 500)
+    ok(len(token) <= rr.MAX_NAME_TOKEN,
+       f"a 500-character token is capped to {len(token)} chars")
+    ok(rr.safe_name("") == "x" and rr.safe_name(None, "subject") == "subject",
+       "empty input still falls back to the default")
+    ok(rr.safe_name("P 07/b") == "P-07-b", "unsafe characters are still replaced")
+
+
+# ── the sim server's own disconnect path (QA L3) ────────────────────────────
+
+def test_sim_server_last_client_disconnect_finalizes():
+    """The sim fork has its own copy of the handler; test it, not the live one."""
+    if not HAVE_NUMPY:
+        return _skip("sim last-client finalize")
+
+    async def scenario(output):
+        srv = SimulatedWebSocketServer(npz_path="unused.npz", output_folder=output)
+        srv.sample_rate = 100.0
+        srv.n_channels = 4
+        srv.sent = []
+
+        async def record_broadcast(message):
+            srv.sent.append(message)
+
+        srv.broadcast = record_broadcast
+
+        await srv.start_recording(META)
+        srv._spool_write(_chunk(4, 10))
+
+        await srv.handle_client(_EmptySocket("only"))
+
+        ok(srv.recording.is_recording is False,
+           "the sim server finalises when its last client goes")
+        ok(len(_pkls(output)) == 1, "and writes a normal .pkl")
+        ok(not _spools(output), "with its spool cleaned up")
+
+    with _Workspace() as output:
+        arun(lambda: scenario(output))
+
+
 TESTS = [
     test_spool_is_written_incrementally_and_nothing_is_kept_in_ram,
     test_saved_file_matches_the_pre_spool_format,
@@ -578,6 +936,16 @@ TESTS = [
     test_mv_record_start_refuses_a_second_capture,
     test_last_client_disconnect_finalizes_the_recording,
     test_sim_server_teardown_saves_an_active_recording,
+    # QA round: concurrency, visibility, dtype, tool hardening
+    test_start_during_a_slow_stop_is_not_clobbered,
+    test_no_data_recorded_sends_recording_status,
+    test_first_spool_write_error_is_broadcast_and_persisted,
+    test_widening_dtype_never_narrows_the_recording,
+    test_crash_mid_widening_recovers_every_complete_segment,
+    test_recover_warns_about_a_live_spool,
+    test_listing_flags_post_save_debris,
+    test_safe_name_is_length_capped,
+    test_sim_server_last_client_disconnect_finalizes,
 ]
 
 
