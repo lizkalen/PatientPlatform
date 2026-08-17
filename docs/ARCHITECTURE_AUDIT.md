@@ -486,9 +486,12 @@ ever bound to a LAN, all of this is remote.
 The two existing plans stay valid; this reorders around them.
 
 1. ~~Commit the tree~~ — done (`0ed49db`).
-2. **Server-side stimulation authority (S8) + fend Phase A + one visible banner** wired to
-   the currently subscriber-less channels (S6, B6). This is the minimum bar before the
-   next patient session that uses stimulation.
+2. **Server-side stimulation authority (S8) + fend Phase A + one visible banner** — done
+   (`d3a90de..3426ffd`: implementation, adversarial QA, and fix rounds; both sides
+   harness-tested). Still open from this package, and closable only outside the code:
+   clinical review of the `StimLimits` ceilings, and the bench tests in the scope note
+   below (samolator behaviour on client death, retry-give-up visibility, Windows Ctrl+C
+   teardown).
 3. **Recording integrity (P5, B1, B2):** incremental flush, `_mv_paused` fix, recording
    state in the connect payload, sidecar-first online writer, filename collision fix.
 4. **Process lifecycle (P1–P3):** fix or replace the launchers; port-bind failure must be

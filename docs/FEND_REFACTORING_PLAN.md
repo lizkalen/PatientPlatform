@@ -11,11 +11,14 @@ stamped `GIT_SHA` only became meaningful with commit `0ed49db`, when the tree fi
 entered version control). Phases A–H are outstanding; A1 (`emergencyStop` not terminal)
 and A4 (`skipToNext` doesn't stop stim) were re-verified live in the source at audit time.
 
-**Read `docs/ARCHITECTURE_AUDIT.md` before starting Phase A.** Its conclusion: Phase A's
-guarantees cannot be anchored in the browser — a crashed tab runs no JavaScript, and the
-server currently stops stimulation on no teardown path whatsoever (audit S2). Phase A
-remains necessary as the operator-facing layer, but it lands together with the
-server-side stimulation authority described in audit S8, not instead of it.
+**Phase A is complete** (`54d0e2b..e409d44`, landed together with the server-side
+stimulation authority from audit S8 as `d3a90de..3426ffd`) — including a minimal slice of
+B2: a shared status banner visible in patient mode, wired to the stimulation/device
+channels. A1–A4 were implemented, adversarially QA'd, and hardened (failed-stop retry,
+watchdog fault-latches, reconnect rehydration). The bench verification under "Verify
+Phase A" still needs to be run with a scope on a dummy load. Phases B (beyond the banner
+slice) through H remain outstanding; read `docs/ARCHITECTURE_AUDIT.md` before each — the
+audit's priority stack supersedes this plan's ordering.
 
 ---
 
