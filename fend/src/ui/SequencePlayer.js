@@ -245,9 +245,11 @@ export default class SequencePlayer {
 	 *
 	 * Without this the subject keeps performing every cued rep into a void while the
 	 * RECORDING indicator pulses and the block is lost with no signal to anyone
-	 * (plan B1). NOTHING is sent: the socket is gone, and the server finalizes the
-	 * partial recording on its side, so there is no stop to issue. The stimulation
-	 * half is separate — `_stopStimulation` latches its own retry for the reconnect.
+	 * (plan B1). NOTHING is sent: the socket is gone, so there is no stop to issue.
+	 * The data captured so far is kept on the server; whether it is written out
+	 * depends on the capture path, so the operator is told to Reset before re-running
+	 * rather than promised a finished file. The stimulation half is separate —
+	 * `_stopStimulation` latches its own retry for the reconnect.
 	 *
 	 * Unlike stop(), the position is preserved: a disconnect is recoverable, and the
 	 * operator decides what to do after reconnecting. Unlike the session's HALTED
@@ -260,11 +262,15 @@ export default class SequencePlayer {
 		this._removeAnimationListener();
 		this._clearPhaseTimer();
 		this.isPlaying = false;
+		// Alarm BEFORE stopping stim. The banner shows the most recent alarm, and
+		// _stopStimulation may raise STOP NOT SENT — the more urgent message, because a
+		// train may still be running. Raising ours first leaves that one visible.
+		this._raiseAlarm('RECORDING INTERRUPTED — connection lost. Data so far is kept on the '
+			+ 'server; reconnect, then Reset before re-running the block.');
 		this._stopStimulation();
 		if (this.webglView) this.webglView.pause();
 		this._setPhase(PHASE.IDLE, 0);
 		this._notifyChange();
-		this._raiseAlarm('RECORDING INTERRUPTED — connection lost; the server saves the partial block');
 		return true;
 	}
 
@@ -693,6 +699,11 @@ export default class SequencePlayer {
 			// Transition phase while loading
 			this._setPhase(PHASE.TRANSITION, 0);
 			await this._loadModelAndWait(item.model);
+			// Playback may have been stopped or halted while we were suspended. Nothing
+			// below may run in that case: it would restart the animation and arm a fresh
+			// phase timer that the halt had no way to clear. (Awaits here are not yet
+			// cancellable — that is plan C4; this is the guard until then.)
+			if (!this.isPlaying) return;
 		}
 
 		// Play the specified animation. A stim-rest item advances the animation (so phase
@@ -703,6 +714,9 @@ export default class SequencePlayer {
 		// Show tutorial if enabled (before each new item, first rep only, first loop only)
 		if (this._tutorialEnabled && this.currentRepetition === 0 && !this._hasCompletedFirstRun) {
 			await this._showTutorial(item);
+			// Same re-check as above: a Stop or a disconnect during the tutorial must not
+			// be undone when the patient presses "I'm Ready" (plan C4 makes this proper).
+			if (!this.isPlaying) return;
 		}
 
 		// Set up loop mode for repetitions

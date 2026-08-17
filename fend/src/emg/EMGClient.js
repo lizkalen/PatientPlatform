@@ -1013,8 +1013,10 @@ export default class EMGClient {
 		// left it true forever: the UI went on asserting that data was being captured
 		// while nothing was connected (audit B1). Clear it and fan the change out, so the
 		// pulsing RECORDING indicator stops. This is a statement about THIS CLIENT, not
-		// about the server — the server finalizes the partial block on its side, and the
-		// connect payload restores the truth if it is still recording when we return.
+		// about the server — what was captured stays on the server, and the connect
+		// payload restores the truth if it is still recording when we return. It does
+		// NOT assert that a file was written: only the plain recording path spools and
+		// recovers, and only when the last client goes away.
 		//
 		// Deliberately NOT done for stimulation: a dropped socket is no evidence that a
 		// train stopped, which is the whole point of the pending-stop latch (audit S5).
