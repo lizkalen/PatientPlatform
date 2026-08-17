@@ -73,6 +73,7 @@ import argparse
 import os
 import pickle as pkl
 import sys
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -82,6 +83,14 @@ SPOOL_SUFFIX = ".spool"
 SPOOL_KIND = "emg_recording_spool"
 SPOOL_LAYOUT = ("samples-major: np.fromfile(spool, dtype).reshape(-1, n_channels).T")
 
+# Cap on one filename token (subject, session). See safe_name.
+MAX_NAME_TOKEN = 40
+
+# A spool touched more recently than this is probably still being written.
+LIVE_SPOOL_AGE_S = 30.0
+# How long to watch a spool for growth before deciding it is idle.
+LIVE_SPOOL_SETTLE_S = 0.5
+
 
 # ── paths ────────────────────────────────────────────────────────────────────
 
@@ -90,14 +99,23 @@ def sidecar_path(spool_path: str) -> str:
     return spool_path + ".pkl"
 
 
-def safe_name(s, default: str = "x") -> str:
+def safe_name(s, default: str = "x", max_len: int = MAX_NAME_TOKEN) -> str:
     """Filesystem-safe token for building informative recording filenames.
 
     Lives here rather than on a server class so both WebSocket servers and this
     tool agree on how a subject/session token is spelled on disk.
+
+    Length-capped: subject and session come from free-text frontend fields, and
+    two long ones plus the prefix, timestamp and suffix can push the path past
+    Windows' 260-character MAX_PATH — where `open()` fails and, before the cap,
+    the recording simply refused to start. Truncation can collide; `unique_path`
+    resolves that.
     """
     s = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in str(s or default))
-    return s.strip("-. ") or default
+    s = s.strip("-. ")
+    if len(s) > max_len:
+        s = s[:max_len].strip("-. ")
+    return s or default
 
 
 def unique_path(path: str) -> str:
@@ -168,39 +186,119 @@ def read_sidecar(spool_path: str) -> dict:
 
 # ── reassembly ───────────────────────────────────────────────────────────────
 
+def segment_paths(spool_path: str, info: dict) -> list:
+    """``[(path, dtype)]`` for every segment of a recording, oldest first.
+
+    A recording is normally one file. It gains a second one only when the
+    sample dtype WIDENS mid-recording (see the servers' `_spool_write`): the
+    stream continues into ``<name>.spool.1``, ``.2``, ... each carrying its own
+    dtype, and reassembly promotes across them. Rewriting the gigabytes already
+    spooled would be both slow and un-crash-safe; appending a new segment is
+    neither.
+
+    Sidecars written before segmenting existed carry no ``segments`` key and
+    are treated as a single segment, so old spools still recover.
+    """
+    folder = os.path.dirname(os.path.abspath(spool_path))
+    default_dtype = info.get("dtype") or "float32"
+    segments = info.get("segments")
+    if not segments:
+        return [(spool_path, np.dtype(default_dtype))]
+    out = []
+    for segment in segments:
+        name = segment.get("file")
+        if not name:
+            continue
+        out.append((os.path.join(folder, name),
+                    np.dtype(segment.get("dtype") or default_dtype)))
+    return out or [(spool_path, np.dtype(default_dtype))]
+
+
 def spool_sample_count(spool_path: str, info: dict) -> int:
-    """Complete samples currently in the spool, from its size on disk."""
+    """Complete samples currently on disk, summed across segments."""
     n_channels = int(info.get("n_channels") or 0)
-    dtype = np.dtype(info.get("dtype") or "float32")
     if n_channels <= 0:
         return 0
-    return os.path.getsize(spool_path) // (n_channels * dtype.itemsize)
+    total = 0
+    for path, dtype in segment_paths(spool_path, info):
+        try:
+            total += os.path.getsize(path) // (n_channels * dtype.itemsize)
+        except OSError:
+            pass                       # a segment registered but never created
+    return total
 
 
 def load_spool(spool_path: str, info: dict) -> np.ndarray:
     """Reassemble a spool into the ``(n_channels, n_samples)`` recording array.
 
-    Returns a C-contiguous array, matching the layout the old
-    ``np.hstack`` path produced, so the pickled result is identical.
+    Returns a C-contiguous array, matching the layout the old ``np.hstack``
+    path produced, so the pickled result is identical. Segments are
+    concatenated in order and numpy promotes to their common dtype, which is
+    what the old in-RAM ``hstack`` did too.
     """
     n_channels = int(info.get("n_channels") or 0)
     if n_channels <= 0:
         raise ValueError(f"sidecar reports n_channels={n_channels!r}; cannot "
                          f"interpret the spool")
-    dtype = np.dtype(info.get("dtype") or "float32")
 
-    flat = np.fromfile(spool_path, dtype=dtype)
-    if flat.size == 0:
-        return np.empty((n_channels, 0), dtype=dtype)
+    blocks = []
+    for path, dtype in segment_paths(spool_path, info):
+        if not os.path.exists(path):
+            # Registered in the sidecar but never written: the process died in
+            # the instant between the two. Everything before it is still good.
+            print(f"[recover] segment {os.path.basename(path)} is missing; "
+                  f"the writer died before creating it")
+            continue
+        flat = np.fromfile(path, dtype=dtype)
+        if flat.size == 0:
+            continue
+        complete = (flat.size // n_channels) * n_channels
+        if complete != flat.size:
+            # The writer died part-way through a sample. Drop the fragment
+            # rather than refuse the whole recording over the last few bytes.
+            print(f"[recover] discarding {flat.size - complete} trailing "
+                  f"value(s) from {os.path.basename(path)}: it ends mid-sample")
+            flat = flat[:complete]
+        if flat.size:
+            blocks.append(flat.reshape(-1, n_channels).T)
 
-    complete = (flat.size // n_channels) * n_channels
-    if complete != flat.size:
-        # The writer died part-way through a sample. Drop the fragment rather
-        # than refuse the whole recording over the last few bytes.
-        print(f"[recover] discarding {flat.size - complete} trailing value(s): "
-              f"the spool ends mid-sample (the writer was interrupted)")
-        flat = flat[:complete]
-    return np.ascontiguousarray(flat.reshape(-1, n_channels).T)
+    if not blocks:
+        return np.empty((n_channels, 0),
+                        dtype=np.dtype(info.get("dtype") or "float32"))
+    if len(blocks) == 1:
+        return np.ascontiguousarray(blocks[0])
+    return np.ascontiguousarray(np.hstack(blocks))      # promotes, never narrows
+
+
+def liveness_warnings(spool_path: str, info: dict,
+                      settle_s: float = LIVE_SPOOL_SETTLE_S) -> list:
+    """Reasons to suspect a server is still writing to this spool.
+
+    Recovering a live spool is harmless in itself - the read is passive - but
+    the result is a partial recording that the server is about to supersede
+    with a complete one, so it is worth saying loudly. Heuristics only, hence
+    warnings and never a refusal: the sidecar's sample count is refreshed just
+    three times per recording (start, first chunk, close), so it lags by design.
+    """
+    warnings = []
+    before = spool_sample_count(spool_path, info)
+    time.sleep(settle_s)
+    after = spool_sample_count(spool_path, info)
+    if after > before:
+        warnings.append(
+            f"it GREW by {after - before} samples in {settle_s:g}s — a server "
+            f"is recording into it right now")
+    try:
+        newest = max(os.path.getmtime(p) for p, _ in segment_paths(spool_path, info)
+                     if os.path.exists(p))
+        age = time.time() - newest
+        if age < LIVE_SPOOL_AGE_S:
+            warnings.append(
+                f"it was last written {age:.1f}s ago (under {LIVE_SPOOL_AGE_S:g}s) "
+                f"— a recording may still be active")
+    except (OSError, ValueError):
+        pass
+    return warnings
 
 
 def build_recording_payload(data, info: dict, timestamp: Optional[str] = None,
@@ -236,6 +334,17 @@ def build_recording_payload(data, info: dict, timestamp: Optional[str] = None,
 
 # ── the tool ─────────────────────────────────────────────────────────────────
 
+def final_pkl_siblings(spool_path: str) -> list:
+    """Final ``.pkl`` files a server would have written for this spool.
+
+    Their presence beside a spool means the save succeeded and the process died
+    before the cleanup — debris, not a lost recording.
+    """
+    base = (spool_path[:-len(SPOOL_SUFFIX)] if spool_path.endswith(SPOOL_SUFFIX)
+            else spool_path)
+    return [p for p in (base + ".pkl", base + "_classif.pkl") if os.path.exists(p)]
+
+
 def recover(spool_path: str, out_path: Optional[str] = None) -> str:
     """Reassemble one orphaned spool into a ``.pkl``. Returns the written path."""
     spool_path = os.path.abspath(spool_path)
@@ -243,6 +352,19 @@ def recover(spool_path: str, out_path: Optional[str] = None) -> str:
         raise FileNotFoundError(spool_path)
 
     info = read_sidecar(spool_path)
+
+    for warning in liveness_warnings(spool_path, info):
+        print(f"[recover] *** WARNING: {warning} ***")
+        print("[recover]     Recovering anyway, but the result will be a PARTIAL "
+              "recording that the running server is about to replace with a "
+              "complete one. Stop the backend first if that is not what you want.")
+
+    existing = final_pkl_siblings(spool_path)
+    if existing:
+        print(f"[recover] note: a final recording already exists beside this spool "
+              f"({', '.join(os.path.basename(p) for p in existing)}). The save "
+              f"probably succeeded and only the cleanup was interrupted.")
+
     data = load_spool(spool_path, info)
     if data.shape[1] == 0:
         raise ValueError(f"{os.path.basename(spool_path)} contains no samples; "
@@ -280,22 +402,49 @@ def find_spools(folder: str) -> list:
 
 def _print_listing(folder: str) -> int:
     spools = find_spools(folder)
+    partials = sorted(n for n in os.listdir(folder) if n.endswith(".partial"))
+
     if not spools:
         print(f"No orphaned spools in {folder}")
-        return 0
-    print(f"{len(spools)} spool(s) in {folder}:")
-    for path in spools:
-        try:
-            info = read_sidecar(path)
-            n = spool_sample_count(path, info)
-            srate = info.get("srate") or 0
-            duration = f"{n / srate:.1f}s" if srate else f"{n} samples"
-            meta = info.get("trial_metadata") or {}
-            who = f"{meta.get('subjectId') or '?'}/{meta.get('sessionId') or '?'}"
-            print(f"  {os.path.basename(path):<60s} {duration:>10s}  {who}")
-        except Exception as exc:                                   # noqa: BLE001
-            print(f"  {os.path.basename(path):<60s} UNREADABLE: {exc}")
-    print("\nRecover one with:\n  python -m server.recover_recording <spool-file>")
+    else:
+        print(f"{len(spools)} spool(s) in {folder}:")
+        for path in spools:
+            try:
+                info = read_sidecar(path)
+                n = spool_sample_count(path, info)
+                srate = info.get("srate") or 0
+                duration = f"{n / srate:.1f}s" if srate else f"{n} samples"
+                meta = info.get("trial_metadata") or {}
+                who = f"{meta.get('subjectId') or '?'}/{meta.get('sessionId') or '?'}"
+                print(f"  {os.path.basename(path):<58s} {duration:>10s}  {who}")
+
+                notes = [f"LIVE? {w}" for w in liveness_warnings(path, info)]
+                existing = final_pkl_siblings(path)
+                if existing:
+                    notes.append(
+                        "a final recording already exists beside it "
+                        f"({', '.join(os.path.basename(p) for p in existing)}) — "
+                        "the save succeeded and only the cleanup was interrupted; "
+                        "this spool is probably safe to delete")
+                if info.get("spool_write_errors"):
+                    notes.append(f"the server logged write errors during this "
+                                 f"recording: {info['spool_write_errors']}")
+                segments = info.get("segments") or []
+                if len(segments) > 1:
+                    notes.append(f"{len(segments)} segments (the sample dtype "
+                                 f"widened mid-recording)")
+                for note in notes:
+                    print(f"      - {note}")
+            except Exception as exc:                               # noqa: BLE001
+                print(f"  {os.path.basename(path):<58s} UNREADABLE: {exc}")
+        print("\nRecover one with:\n  python -m server.recover_recording <spool-file>")
+
+    if partials:
+        print(f"\n{len(partials)} interrupted write(s) (*.partial) — a save was "
+              f"cut off part-way; these are incomplete and safe to delete once "
+              f"the matching spool has been recovered:")
+        for name in partials:
+            print(f"  {name}")
     return 0
 
 
