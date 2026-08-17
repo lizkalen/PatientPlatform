@@ -60,8 +60,12 @@ export default class SequencePlayer {
 		this._timeline = null;
 		this._lastPhaseStartTime = null;
 
-		// Whether a stimulation train we started is currently running
+		// Whether a stimulation train we started is currently running. Cleared ONLY on a
+		// confirmed send, so a stop that never left the socket cannot be recorded as a
+		// success (plan A2) — `_pendingStop` latches that retry for the next connect.
 		this._stimActive = false;
+		this._pendingStop = false;
+		this._alarmListeners = [];   // operator-visible stim alarms -> status banner
 
 		// When true, an external driver owns the EMG recording lifecycle and the
 		// player must not start/stop recordings itself. MovementSessionController
@@ -514,25 +518,29 @@ export default class SequencePlayer {
 	_handleStimulationTransition(oldPhase, newPhase) {
 		const stim = this.config?.stimulation;
 		if (!stim || !stim.enabled) return;
-		if (!this.onEMGClient || !this.onEMGClient.isConnected) return;
+		if (!this.onEMGClient) return;
 
 		const enteringMove = newPhase === PHASE.MOVE && oldPhase !== PHASE.MOVE;
 		const leavingMove = oldPhase === PHASE.MOVE && newPhase !== PHASE.MOVE;
 
 		if (enteringMove) {
+			if (!this.onEMGClient.isConnected) return;   // nothing to start over a dead socket
 			const item = this.config?.items?.[this.currentItemIndex];
 			if (item?.stimulate && !this._stimActive) {
 				// Per-movement channels if defined for this item, else the global ones.
 				const channels = item.stim?.channels?.length ? item.stim.channels : stim.channels;
-				this.onEMGClient.stimulateStart({
+				const sent = this.onEMGClient.stimulateStart({
 					channels,
 					stimulatorType: stim.stimulatorType,
 					port: stim.port,
 					controllerUrl: stim.controllerUrl,
 				});
-				this._stimActive = true;
+				// Claim the train only if the command actually left the socket.
+				if (sent) this._stimActive = true;
 			}
 		} else if (leavingMove) {
+			// Runs even while disconnected: _stopStimulation latches the retry itself,
+			// and skipping it here would leave a live train with nothing tracking it.
 			this._stopStimulation();
 		}
 	}
@@ -541,14 +549,46 @@ export default class SequencePlayer {
 	 * Stop stimulation if we believe a train is running. Idempotent and safe to
 	 * call from any teardown path (pause/stop/complete) so stimulation never
 	 * outlives the movement, even on paths that don't emit a phase change.
+	 *
+	 * `_stimActive` is cleared ONLY on a confirmed send. A dead socket leaves the
+	 * train running server-side, so the belief is retained (a second Stop press must
+	 * still send), the retry is latched for the next connect, and the operator is
+	 * alarmed rather than shown a silent "stopped" (plan A2).
+	 *
+	 * @returns {boolean} whether the command left the socket
 	 */
 	_stopStimulation() {
-		if (!this._stimActive) return;
-		this._stimActive = false;
-		if (this.onEMGClient && this.onEMGClient.isConnected) {
-			this.onEMGClient.stimulateStop({
-				controllerUrl: this.config?.stimulation?.controllerUrl,
-			});
+		if (!this._stimActive && !this._pendingStop) return true;
+		if (!this.onEMGClient) { this._stimActive = false; this._pendingStop = false; return true; }
+		const sent = this.onEMGClient.stimulateStop({
+			controllerUrl: this.config?.stimulation?.controllerUrl,
+		});
+		if (sent) {
+			this._stimActive = false;
+			this._pendingStop = false;
+		} else {
+			const first = !this._pendingStop;
+			this._pendingStop = true;
+			if (first) {
+				this._raiseAlarm('STOP NOT SENT — no connection to the server; '
+					+ 'sequence stimulation may still be running');
+			}
+		}
+		return sent;
+	}
+
+	/** Retry a stop that never left the socket. Wired to the client's connect hook. */
+	flushPendingStimStop() {
+		if (this._pendingStop) this._stopStimulation();
+	}
+
+	/** Subscribe to operator-visible stim alarms. Called with a message string. */
+	onAlarm(cb) { this._alarmListeners.push(cb); }
+
+	_raiseAlarm(message) {
+		console.warn('[SequencePlayer] ALARM:', message);
+		for (const cb of this._alarmListeners) {
+			try { cb(message); } catch (e) { console.error('SequencePlayer alarm listener error', e); }
 		}
 	}
 

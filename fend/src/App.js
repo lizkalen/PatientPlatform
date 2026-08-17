@@ -145,6 +145,11 @@ export default class App {
 
 		// Hook sequence player to EMG recording
 		this.sequencePlayer.onEMGClient = this.emgClient;
+		// The player is the third stim driver (auto-stim on the MOVE phase), so it gets
+		// the same A2 treatment as the other two: alarms on the banner, and a stop that
+		// never left the socket retried on the next connect.
+		this.sequencePlayer.onAlarm((message) => this.statusBanner.raiseAlarm(message));
+		this.emgClient.onConnect(() => this.sequencePlayer.flushPendingStimStop());
 	}
 
 	initDecomposition() {
