@@ -861,6 +861,7 @@ export default class MovementSessionController {
 		this.client.onConnect?.(() => {
 			if (this._pendingStimStop) this._stopTimedStim({ force: true });
 		});
+		this.client.onDisconnect?.(() => this._onDisconnect());
 
 		this.client.onMvTrainStatus((msg) => this._onTrainStatus(msg));
 		this.client.onConfigStatus?.((msg) => this._onConfigStatus(msg));
@@ -881,6 +882,39 @@ export default class MovementSessionController {
 				}
 			}
 		});
+	}
+
+	/** States in which a dropped connection has actually cost the operator something:
+	 * a block being cued, a live run, or server-side work whose result we will now miss. */
+	static INTERRUPTIBLE = new Set([
+		SESSION.RECORD_TRAIN, SESSION.RECORD_CLEAN, SESSION.RECORD_CALIB,
+		SESSION.TRAINING, SESSION.TRAINING_CLEAN, SESSION.CALIBRATING,
+		SESSION.SENSOR_SIM, SESSION.ONLINE,
+	]);
+
+	/**
+	 * The socket dropped. This is RECOVERABLE and deliberately does NOT use the HALTED
+	 * latch: HALTED means "stimulation was stopped in an emergency and nothing may
+	 * re-arm until an operator says so", and diluting it with routine network trouble
+	 * would make the one screen that matters ambiguous. A disconnect goes to the
+	 * ordinary error surface, which already offers Restart -> reset().
+	 *
+	 * The player raises the operator-visible RECORDING INTERRUPTED alarm (it is the
+	 * component that knows a run was in progress, and it covers standalone playback
+	 * too), so this path does not duplicate it on the banner.
+	 */
+	_onDisconnect() {
+		if (!MovementSessionController.INTERRUPTIBLE.has(this.state)) return;
+		const was = this.state;
+		this._clearSensorTimers();
+		// If a timed train was firing, this cannot send — it latches the retry for the
+		// reconnect and raises its own (different, higher-priority) alarm.
+		this._stopTimedStim();
+		this._sensorStim = null;
+		this._mvPaused = false;
+		this.trainLog.push({ t: Date.now(), level: 'warn', line: `disconnected during "${was}"` });
+		this._fail('Connection lost during the block — cueing stopped. The server saves whatever '
+			+ 'was captured; reconnect, then Restart to run this block again.');
 	}
 
 	_onConfigStatus(msg) {

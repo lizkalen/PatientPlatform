@@ -150,6 +150,9 @@ export default class App {
 		// never left the socket retried on the next connect.
 		this.sequencePlayer.onAlarm((message) => this.statusBanner.raiseAlarm(message));
 		this.emgClient.onConnect(() => this.sequencePlayer.flushPendingStimStop());
+		// A drop mid-run must stop the cueing: the subject cannot be left performing
+		// reps into a dead socket (plan B1).
+		this.emgClient.onDisconnect(() => this.sequencePlayer.haltForDisconnect());
 	}
 
 	initDecomposition() {

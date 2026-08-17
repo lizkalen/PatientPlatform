@@ -241,6 +241,34 @@ export default class SequencePlayer {
 	}
 
 	/**
+	 * The connection dropped mid-run: stop cueing immediately.
+	 *
+	 * Without this the subject keeps performing every cued rep into a void while the
+	 * RECORDING indicator pulses and the block is lost with no signal to anyone
+	 * (plan B1). NOTHING is sent: the socket is gone, and the server finalizes the
+	 * partial recording on its side, so there is no stop to issue. The stimulation
+	 * half is separate — `_stopStimulation` latches its own retry for the reconnect.
+	 *
+	 * Unlike stop(), the position is preserved: a disconnect is recoverable, and the
+	 * operator decides what to do after reconnecting. Unlike the session's HALTED
+	 * latch, nothing here is terminal — that is reserved for stim emergencies.
+	 *
+	 * @returns {boolean} whether a run was actually interrupted
+	 */
+	haltForDisconnect() {
+		if (!this.isPlaying) return false;
+		this._removeAnimationListener();
+		this._clearPhaseTimer();
+		this.isPlaying = false;
+		this._stopStimulation();
+		if (this.webglView) this.webglView.pause();
+		this._setPhase(PHASE.IDLE, 0);
+		this._notifyChange();
+		this._raiseAlarm('RECORDING INTERRUPTED — connection lost; the server saves the partial block');
+		return true;
+	}
+
+	/**
 	 * Reset to beginning without changing playing state
 	 */
 	reset() {
