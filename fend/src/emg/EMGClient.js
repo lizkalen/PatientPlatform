@@ -19,6 +19,12 @@ export default class EMGClient {
 		this.isConnected = false;
 		this.isRecording = false;
 
+		// The SERVER's belief about the stimulator, mirrored from the `connected`
+		// payload and every `stimulation_status`. The backend is the stimulation
+		// authority, so this — not any driver's private flag — is the truth a
+		// reconnecting client must adopt (audit S5/B1).
+		this.stimulationActive = false;
+
 		// Server info (received on connect)
 		this.sampleRate = null;
 		this.nChannels = null;
@@ -238,6 +244,7 @@ export default class EMGClient {
 	 * @param {string} [opts.stimulatorType] - 'science_mode3' | 'science_mode4' | 'mock'
 	 * @param {string} [opts.port] - Device COM port (optional)
 	 * @param {string} [opts.controllerUrl] - Override stimulator controller base URL
+	 * @returns {boolean} true only if the command actually left the socket
 	 */
 	stimulateStart({ channels, stimulatorType, port, controllerUrl } = {}) {
 		const message = { command: 'stimulate_start' };
@@ -245,18 +252,24 @@ export default class EMGClient {
 		if (stimulatorType) message.stimulator_type = stimulatorType;
 		if (port) message.port = port;
 		if (controllerUrl) message.controller_url = controllerUrl;
-		this._send(message);
+		return this._send(message);
 	}
 
 	/**
 	 * Stop any active stimulation on the external stimulator.
+	 *
+	 * CALLERS MUST CHECK THE RETURN VALUE. A dead socket returns false and the train
+	 * keeps running server-side; treating that as a successful stop is the defect in
+	 * audit A2. Confirmation of the stop itself arrives as `stimulation_status`.
+	 *
 	 * @param {object} [opts]
 	 * @param {string} [opts.controllerUrl] - Override stimulator controller base URL
+	 * @returns {boolean} true only if the command actually left the socket
 	 */
 	stimulateStop({ controllerUrl } = {}) {
 		const message = { command: 'stimulate_stop' };
 		if (controllerUrl) message.controller_url = controllerUrl;
-		this._send(message);
+		return this._send(message);
 	}
 
 	// -------------------------------------------------------------------------
@@ -656,6 +669,12 @@ export default class EMGClient {
 		if (Array.isArray(msg.movement_class_order)) {
 			this.movementClassOrder = msg.movement_class_order;
 		}
+		// Recording + stimulation state now ride on the connect payload. Both were
+		// previously assumed false on every (re)connect: the UI kept asserting
+		// "RECORDING" over a socket that had dropped (audit B1) and the emergency stop
+		// sent nothing because every driver's flag had been reinitialised (audit S5).
+		this.isRecording = msg.recording === true;
+		this.stimulationActive = msg.stimulation_active === true;
 
 		// Initialize channel buffers
 		this.channelBuffers = [];
@@ -675,6 +694,8 @@ export default class EMGClient {
 				nMUs: this.nMUs,
 				classificationActive: this.classificationActive,
 				liveEmgEnabled: this.liveEmgEnabled,
+				recording: this.isRecording,
+				stimulationActive: this.stimulationActive,
 			});
 		}
 
@@ -695,6 +716,24 @@ export default class EMGClient {
 	 * Every consumer handles `active: false`, so a fresh connect is a safe no-op.
 	 */
 	_rehydrateStatusFromConnect(msg) {
+		// Recording: the indicator must reflect the SERVER, not what this tab remembers
+		// from before the drop (audit B1).
+		this._handleRecordingStatus({
+			recording: this.isRecording,
+			message: this.isRecording ? 'Recording in progress (server state on connect)' : null,
+		});
+
+		// Stimulation: `rehydrated` marks this as the server's standing belief rather
+		// than an ack of a command we just sent. `active: true` here means a train is
+		// running that this tab never started — the banner must say so and the drivers
+		// must adopt it, or the emergency stop is suppressed by a stale `false`.
+		this._handleStimulationStatus({
+			type: 'stimulation_status',
+			active: this.stimulationActive,
+			status: 'ok',
+			rehydrated: true,
+		});
+
 		this._handleDecompositionStatus({
 			active: this.decompositionActive,
 			n_mus: this.nMUs,
@@ -718,9 +757,19 @@ export default class EMGClient {
 		});
 	}
 
+	/**
+	 * `stimulation_status`: { active, status: 'ok'|'error', reason?, message? }.
+	 *
+	 * `active` is the SERVER's actual belief, not an echo of the command — a stop that
+	 * failed at the hardware arrives as { active: true, status: 'error' } while the
+	 * server retries in the background, and lands again as { active: false } when it
+	 * succeeds. ('success' is accepted for older servers.)
+	 */
 	_handleStimulationStatus(msg) {
-		if (msg.status && msg.status !== 'success') {
-			console.warn('EMGClient: stimulation command failed -', msg.status, msg.message || '');
+		if (typeof msg.active === 'boolean') this.stimulationActive = msg.active;
+		if (msg.status && msg.status !== 'ok' && msg.status !== 'success') {
+			console.warn('EMGClient: stimulation command failed -', msg.status,
+				msg.reason || '', msg.message || '', `(server active: ${msg.active})`);
 		}
 		for (const cb of this.onStimulationStatusCallbacks) {
 			cb(msg);
