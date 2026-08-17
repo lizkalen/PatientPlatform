@@ -18,6 +18,13 @@ import assert from 'node:assert/strict';
 // Must run before any suite dynamically imports from src/. See the hook's comment.
 register('./resolve-extensionless.mjs', import.meta.url);
 
+// Vite injects these as build-time constants (vite.config.js `define`), and
+// SequencePlayer._buildTrialMetadata reads them; supply them so the real player can
+// be driven under plain Node.
+globalThis.APP_NAME ??= 'patientgui-frontend';
+globalThis.APP_VERSION ??= '0.0.0-test';
+globalThis.GIT_SHA ??= 'test';
+
 /** URL of a module under `fend/src`, resolved against THIS FILE, never the cwd. */
 export function srcUrl(rel) {
 	return new URL(`../src/${rel}`, import.meta.url).href;
@@ -93,8 +100,16 @@ export function fakeEmgClient() {
 		// -- commands (return value == "did it leave the socket") --
 		stimulateStart(msg) { this.sent.push(['start', msg]); return this.sendOk; },
 		stimulateStop(msg) { this.sent.push(['stop', msg]); return this.sendOk; },
-		mvRecordStop() {},
-		mvOnlineStop() {},
+		// Recorded, not stubbed: closing an orphaned capture is the difference between
+		// the next block recording and the server refusing it.
+		mvRecordStart(meta) { this.sent.push(['mv_record_start', meta]); },
+		mvRecordStop() { this.sent.push(['mv_record_stop']); },
+		mvRecordPause() { this.sent.push(['mv_record_pause']); },
+		mvRecordResume() { this.sent.push(['mv_record_resume']); },
+		mvOnlineStart(meta) { this.sent.push(['mv_online_start', meta]); },
+		mvOnlineStop() { this.sent.push(['mv_online_stop']); },
+		startRecording(meta) { this.sent.push(['start_recording', meta]); return this.sendOk; },
+		stopRecording(timeline) { this.sent.push(['stop_recording', timeline]); return this.sendOk; },
 
 		// -- server -> client events --
 		decision(d) { for (const cb of this._dec) cb(d); },
@@ -102,9 +117,11 @@ export function fakeEmgClient() {
 		stimStatus(s) { for (const cb of this._stim) cb(s); },
 		connect() { for (const cb of this._conn) cb(); },
 
-		// -- assertions helpers --
+		// -- assertion helpers --
 		stops() { return this.sent.filter((x) => x[0] === 'stop').length; },
 		starts() { return this.sent.filter((x) => x[0] === 'start').length; },
+		commands() { return this.sent.map((x) => x[0]); },
+		didSend(command) { return this.sent.some((x) => x[0] === command); },
 	};
 }
 
