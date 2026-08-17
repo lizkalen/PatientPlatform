@@ -118,6 +118,55 @@ export default async function run() {
 		t.check('pending stop cleared', stim._pendingStop === false);
 	}
 
+	// ==== isRecording round trip, through the real socket handlers =============
+	t.section('EMGClient: isRecording is honest across a drop');
+	{
+		// Stand in for the browser's WebSocket so connect() wires ITS OWN onopen/onclose
+		// handlers — the drop below goes through the real code path, not a shortcut.
+		class FakeWebSocket {
+			static OPEN = 1;
+			static last = null;
+			constructor(url) { this.url = url; this.readyState = 1; FakeWebSocket.last = this; }
+			send() {}
+			close() { this.readyState = 3; this.onclose?.(); }
+		}
+		const realWs = globalThis.WebSocket;
+		globalThis.WebSocket = FakeWebSocket;
+		t.defer(() => { globalThis.WebSocket = realWs; });
+
+		const client = new EMGClient({ autoReconnect: false });
+		const seen = [];
+		client.onRecordingStatus((s) => seen.push(s.recording));
+		const connected = (recording) => client._handleConnected({
+			type: 'connected', n_channels: 2, sample_rate: 2048,
+			recording, stimulation_active: false,
+		});
+
+		client.connect();
+		FakeWebSocket.last.onopen();
+		connected(true);                              // server was already recording
+		t.check('recording adopted on connect', client.isRecording === true);
+		t.check('indicator switched on', seen[seen.length - 1] === true);
+
+		FakeWebSocket.last.close();                   // the drop, via the real onclose
+		t.check('isRecording cleared on disconnect', client.isRecording === false);
+		t.check('indicator switched off', seen[seen.length - 1] === false);
+		t.check('the UI stopped asserting capture over a dead socket',
+			seen.filter((r) => r === false).length === 1);
+
+		client.connect();                             // back, server still recording
+		FakeWebSocket.last.onopen();
+		connected(true);
+		t.check('server truth re-adopted on reconnect', client.isRecording === true);
+		t.check('indicator back on', seen[seen.length - 1] === true);
+
+		FakeWebSocket.last.close();
+		client.connect();                             // back, but recording has ended
+		FakeWebSocket.last.onopen();
+		connected(false);
+		t.check('a finished recording is not resurrected', client.isRecording === false);
+	}
+
 	// ==== watchdog lifecycle across a failed stop ==============================
 	t.section('a failed stop must not tear down the watchdog');
 	{

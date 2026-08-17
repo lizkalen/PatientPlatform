@@ -21,6 +21,7 @@ const SUITES = [
 	'./stim-controller.test.mjs',
 	'./stop-retry-reconnect.test.mjs',
 	'./sensor-hard-stop.test.mjs',
+	'./disconnect-recovery.test.mjs',
 ];
 
 const results = [];
