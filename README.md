@@ -50,7 +50,10 @@ Use this mode to test the system without Ripple hardware.
 
 4. **Open your browser** to `http://localhost:8080`
 
-> **Note**: The simulation mode uses a pre-configured data file. To use your own data, edit the path in `start_sim.bat` line 70.
+> **Note**: Simulation mode plays back `sim/datafile1_filtered.npz`. If that
+> file is missing, `start_sim.bat` offers to generate a synthetic one. To point
+> it at your own recording instead, edit the `SIM_DATA` variable in
+> `start_sim.bat` (in the `:ensure_sim_data` section).
 
 ### Option B: Live Mode (Ripple Hardware)
 
@@ -64,9 +67,30 @@ Use this mode with real Ripple Trellis hardware.
 
 4. **Open your browser** to `http://localhost:8080`
 
+### Option C: Quattrocento / OTBioLab+
+
+Use this mode with an OTBioLab+ acquisition.
+
+1. **Start OTBioLab+** with its TCP/IP option enabled and acquisition running
+   (the server connects to `127.0.0.1:31000`)
+
+2. **Edit `start_quattrocento.bat`** and point `OTB_CONFIG` at your OTBioLab+
+   configuration file — it sets the channel count and sample rate
+
+3. **Double-click `start_quattrocento.bat`**
+
+4. Complete first-time setup if prompted (same as simulation mode)
+
+5. **Open your browser** to `http://localhost:8080`
+
+> **Note**: filtering is **off** by default in this mode, so the recording is
+> the raw stream as OTBioLab+ sends it. Pass `--filter` to change that.
+
 ---
 
 ## Manual Setup (Without Batch Files)
+
+Why do this to yourself?
 
 ### Step 1: Create the Conda Environment
 
@@ -184,6 +208,8 @@ Open your browser to `http://localhost:8080`
 | `--lowcut` | 20.0 | Bandpass low cutoff (Hz) |
 | `--highcut` | 500.0 | Bandpass high cutoff (Hz) |
 | `--notch` | 50.0 | Notch filter frequency (Hz) |
+| `--stim-controller-url` | http://127.0.0.1:11051 | Stimulator controller base URL. Server-side only: a `controller_url` sent by a client is ignored |
+| `--stim-max-seconds` | 30.0 | Dead-man deadline for one stimulation train (s). A backstop against a stranded train, **not** a therapy parameter |
 
 ### Live Server (`server_cli.py`)
 
@@ -200,6 +226,8 @@ Open your browser to `http://localhost:8080`
 | `--lowcut` | 20.0 | Bandpass low cutoff (Hz) |
 | `--highcut` | 500.0 | Bandpass high cutoff (Hz) |
 | `--notch` | 50.0 | Notch filter frequency (Hz) |
+| `--stim-controller-url` | http://127.0.0.1:11051 | Stimulator controller base URL. Server-side only: a `controller_url` sent by a client is ignored |
+| `--stim-max-seconds` | 30.0 | Dead-man deadline for one stimulation train (s). A backstop against a stranded train, **not** a therapy parameter |
 
 ---
 
@@ -290,14 +318,19 @@ or find the owner with `netstat -ano | findstr :8765`.
 
 ```
 PatientGUI/
-├── start.bat              # Quick start - Live mode
-├── start_sim.bat          # Quick start - Simulation mode
+├── start.bat                  # Quick start - Live mode (Ripple)
+├── start_sim.bat              # Quick start - Simulation mode
+├── start_quattrocento.bat     # Quick start - Quattrocento / OTBioLab+
 ├── bend/                  # Backend (Python)
 │   ├── patientgui.yml     # Conda environment specification
+│   ├── tests/             # Backend test suites (stdlib-only, pytest-compatible)
 │   └── src/
 │       └── server/
-│           ├── server_cli.py           # Live server CLI
-│           └── simulate_server_cli.py  # Simulation server CLI
+│           ├── server_cli.py               # Live server CLI
+│           ├── simulate_server_cli.py      # Simulation server CLI
+│           ├── quattrocento_server_cli.py  # Quattrocento server CLI
+│           ├── make_sim_data.py            # Synthetic .npz generator
+│           └── recover_recording.py        # Rebuild a .pkl from a crash spool
 └── fend/                  # Frontend (JavaScript)
     ├── package.json       # npm dependencies
     └── src/
