@@ -19,17 +19,19 @@ The system supports two modes:
 
 Before using PatientGUI, ensure you have:
 
-- **Miniconda or Anaconda** installed (default path: `%USERPROFILE%\miniconda3`)
+- **Miniconda or Anaconda** installed (the launchers probe the usual install
+  locations on both Windows and macOS)
 - **Node.js** (v18 or later recommended)
 - **npm** (comes with Node.js)
 
 For live mode only:
 - **Ripple Trellis hardware** connected, with the Trellis app open
-- **xipppy** library (included in conda environment)
+- **xipppy** library (included in the Windows conda environment; Ripple ships
+  it only as a Windows wheel, so live mode is effectively **Windows-only**)
 
 ---
 
-## Quick Start (Using Batch Files)
+## Quick Start (Windows, Using Batch Files)
 
 ### Option A: Simulation Mode 
 
@@ -88,6 +90,46 @@ Use this mode with an OTBioLab+ acquisition.
 
 ---
 
+## Quick Start (macOS / Linux)
+
+`start.sh` is the counterpart of all three batch files, folded into one script:
+
+```bash
+bash start.sh sim            # Simulation mode (no hardware needed)
+bash start.sh quattrocento   # Quattrocento / OTBioLab+ over TCP
+bash start.sh live           # Ripple hardware - see the note below
+```
+
+(Or `chmod +x start.sh` once and run `./start.sh sim`.)
+
+It performs the same checks as the batch files — first-time setup prompt,
+backend-package provenance, stale backend on port 8765, missing simulation
+data — with two differences:
+
+- The environment is created from **`bend/patientgui.macos.yml`**, a portable
+  spec with the same package versions. `bend/patientgui.yml` is a full win-64
+  export (`pywin32`, `vc14_runtime`, …) and cannot be solved on macOS.
+- Both servers run in **the same terminal** instead of two new windows;
+  `Ctrl-C` stops both.
+
+On first run, answer `Y` to the setup prompt, wait for the environment and npm
+install, then open your browser to `http://localhost:8080`.
+
+> **Live mode on macOS**: Ripple ships `xipppy` only as a Windows wheel, so
+> the macOS environment does not include it and `start.sh live` will warn and
+> refuse unless you have installed a macOS build of `xipppy` yourself.
+> Simulation and Quattrocento modes are fully supported.
+
+> **Quattrocento on macOS**: edit `OTB_CONFIG` near the top of `start.sh`, or
+> pass it inline:
+> `OTB_CONFIG="/path/to/config.otb+stp" bash start.sh quattrocento`
+
+> **LSL note**: `liblsl` comes from conda-forge because the `pylsl` wheel does
+> not bundle it on macOS. If the backend still cannot find it, set
+> `PYLSL_LIB="$CONDA_PREFIX/lib/liblsl.dylib"` or start with `--no-lsl`.
+
+---
+
 ## Manual Setup (Without Batch Files)
 
 Why do this to yourself?
@@ -99,7 +141,10 @@ Why do this to yourself?
 cd PatientPlatform
 
 # Create the environment from the YAML file
+# Windows:
 conda env create -f bend/patientgui.yml
+# macOS / Linux (patientgui.yml is a win-64 export and will not solve here):
+conda env create -f bend/patientgui.macos.yml
 
 # Activate the environment
 conda activate patientgui
@@ -128,7 +173,8 @@ python -c "import server, os; print(os.path.dirname(list(server.__path__)[0]))"
 ```
 
 If it prints a different folder, re-run the `pip install -e` above from this
-one. The `.bat` launchers perform this check automatically and offer to repair.
+one. The `.bat` launchers and `start.sh` perform this check automatically and
+offer to repair.
 
 ### Step 3: Install Frontend Dependencies
 
@@ -281,10 +327,15 @@ To generate a synthetic file in that format instead, see
 
 ### Conda not found
 - Ensure Miniconda/Anaconda is installed
-- The launchers probe `%USERPROFILE%` and `%LOCALAPPDATA%` for `miniconda3` and
-  `anaconda3`, then `%PROGRAMDATA%\miniconda3`
-- If yours is somewhere else, set `CONDA_OVERRIDE` near the top of the `.bat`
-  to the full path of its `Scripts\activate.bat`
+- On Windows, the launchers probe `%USERPROFILE%` and `%LOCALAPPDATA%` for
+  `miniconda3` and `anaconda3`, then `%PROGRAMDATA%\miniconda3`. If yours is
+  somewhere else, set `CONDA_OVERRIDE` near the top of the `.bat` to the full
+  path of its `Scripts\activate.bat`
+- On macOS/Linux, `start.sh` honors an already-configured conda (`CONDA_EXE`)
+  and probes `~/miniconda3`, `~/anaconda3`, `~/opt/...`, `/opt/...`,
+  Homebrew's Caskroom, miniforge and mambaforge. If yours is somewhere else,
+  set `CONDA_OVERRIDE` near the top of `start.sh` to its **base folder** (the
+  one containing `etc/profile.d/conda.sh`)
 
 ### "No module named server"
 The backend package was never installed into the environment. Run
@@ -296,7 +347,8 @@ to repair it; see Step 2 for the manual check.
 ### Port 8765 already in use
 A backend from an earlier run is still alive. The frontend would silently
 connect to it instead of the new one. Close the old **Backend Server** window,
-or find the owner with `netstat -ano | findstr :8765`.
+or find the owner with `netstat -ano | findstr :8765` (Windows) /
+`lsof -nP -iTCP:8765 -sTCP:LISTEN` (macOS/Linux).
 
 ### WebSocket connection failed
 - Verify the backend server is running
@@ -318,11 +370,13 @@ or find the owner with `netstat -ano | findstr :8765`.
 
 ```
 PatientGUI/
-├── start.bat                  # Quick start - Live mode (Ripple)
-├── start_sim.bat              # Quick start - Simulation mode
-├── start_quattrocento.bat     # Quick start - Quattrocento / OTBioLab+
+├── start.bat                  # Quick start - Live mode (Ripple, Windows)
+├── start_sim.bat              # Quick start - Simulation mode (Windows)
+├── start_quattrocento.bat     # Quick start - Quattrocento / OTBioLab+ (Windows)
+├── start.sh                   # Quick start - all three modes (macOS / Linux)
 ├── bend/                  # Backend (Python)
-│   ├── patientgui.yml     # Conda environment specification
+│   ├── patientgui.yml     # Conda environment specification (win-64 export)
+│   ├── patientgui.macos.yml   # Same environment, portable spec for macOS/Linux
 │   ├── tests/             # Backend test suites (stdlib-only, pytest-compatible)
 │   └── src/
 │       └── server/

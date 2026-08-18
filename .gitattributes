@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Launchers must keep their native line endings regardless of checkout config:
+# bash refuses CRLF scripts, and cmd mis-parses LF-only labels.
+*.sh text eol=lf
+*.bat text eol=crlf
