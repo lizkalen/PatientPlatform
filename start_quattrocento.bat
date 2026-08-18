@@ -151,7 +151,13 @@ exit /b 0
 :: check a failed activation leaves whatever python happens to be on PATH -
 :: verified: a Store/Inkscape python answers the provenance question with
 :: "unresolved" and would then receive the repair install.
-call "!CONDA_PATH!" patientgui %~1
+:: %1 is OUR flag, not activate's - conda's activate.bat rejects a second
+:: argument outright, so "quiet" only selects output redirection here.
+if "%~1"=="quiet" (
+    call "!CONDA_PATH!" patientgui >nul 2>&1
+) else (
+    call "!CONDA_PATH!" patientgui
+)
 if errorlevel 1 (
     echo.
     echo [ERROR] Could not activate the 'patientgui' conda environment.
