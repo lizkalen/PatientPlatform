@@ -72,7 +72,7 @@ Use this mode with real Ripple Trellis hardware.
 
 ```bash
 # Navigate to the project directory
-cd PatientGUI
+cd PatientPlatform
 
 # Create the environment from the YAML file
 conda env create -f bend/patientgui.yml
@@ -81,7 +81,32 @@ conda env create -f bend/patientgui.yml
 conda activate patientgui
 ```
 
-### Step 2: Install Frontend Dependencies
+### Step 2: Install the Backend Package
+
+**Do not skip this.** The backend is imported as `server.*`, so without this
+step every launch fails with `No module named server`.
+
+```bash
+conda activate patientgui
+pip install -e ./bend --no-deps
+```
+
+`--no-deps` is deliberate: the environment is owned by `patientgui.yml`, and
+letting pip resolve dependencies too makes pip and conda fight over the same
+packages (see the comment in `bend/pyproject.toml`).
+
+To confirm it points at *this* checkout — an editable install from another
+clone of the repo will silently win otherwise:
+
+```bash
+python -c "import server, os; print(os.path.dirname(list(server.__path__)[0]))"
+# expect: .../PatientPlatform/bend/src
+```
+
+If it prints a different folder, re-run the `pip install -e` above from this
+one. The `.bat` launchers perform this check automatically and offer to repair.
+
+### Step 3: Install Frontend Dependencies
 
 ```bash
 # Navigate to frontend directory
@@ -91,25 +116,41 @@ cd fend
 npm install
 ```
 
-### Step 3: Start the Backend Server
+### Step 4: Start the Backend Server
 
-Open a terminal, activate the conda environment, and run one of the following:
+Open a terminal, activate the conda environment, and run one of the following
+from the repository root. These are `python -m` module invocations — they work
+from anywhere once Step 2 is done, and they are what the `.bat` files run.
 
 **For Simulation Mode:**
 ```bash
 conda activate patientgui
-cd bend
-python src/server/simulate_server_cli.py "path/to/your/data.npz" --port 8765 --pre-trigger 10
+python -m server.simulate_server_cli "path/to/your/data.npz" --port 8765 --pre-trigger 10
 ```
+
+No data file? Generate a synthetic one (64 channels, 60 s, 2000 Hz, ~30 MB):
+
+```bash
+python -m server.make_sim_data sim/datafile1_filtered.npz
+```
+
+That file is band-limited noise with burst envelopes — enough to exercise the
+streaming, filtering, recording and plotting paths, and **not** physiological
+data. Never use it to validate an algorithm, a threshold or a model.
 
 **For Live Mode (Ripple Hardware):**
 ```bash
 conda activate patientgui
-cd bend
-python src/server/server_cli.py --port 8765 --pre-trigger 10
+python -m server.server_cli --port 8765 --pre-trigger 10
 ```
 
-### Step 4: Start the Frontend
+**For Quattrocento / OTBioLab+:**
+```bash
+conda activate patientgui
+python -m server.quattrocento_server_cli --config "path/to/config.otb+stp" --port 8765
+```
+
+### Step 5: Start the Frontend
 
 Open a separate terminal:
 
@@ -118,7 +159,7 @@ cd fend
 npm run dev
 ```
 
-### Step 5: Access the Application
+### Step 6: Access the Application
 
 Open your browser to `http://localhost:8080`
 
@@ -194,11 +235,17 @@ The application has two interface modes:
 
 To use your own EMG data in simulation mode:
 
-1. Save your data as a NumPy `.npz` file with the EMG array
-2. Update the path in `start_sim.bat` or provide it as an argument:
+1. Save your data as a NumPy `.npz` file with the EMG array under the key
+   `data`, shaped `(channels, samples)` — that is what the simulated device
+   reads
+2. Put it at `sim/datafile1_filtered.npz` (what `start_sim.bat` expects) or
+   pass it explicitly:
    ```bash
-   python src/server/simulate_server_cli.py "C:\path\to\your\data.npz" --srate 2000
+   python -m server.simulate_server_cli "C:\path\to\your\data.npz" --srate 2000
    ```
+
+To generate a synthetic file in that format instead, see
+`python -m server.make_sim_data --help`.
 
 ---
 
@@ -206,7 +253,22 @@ To use your own EMG data in simulation mode:
 
 ### Conda not found
 - Ensure Miniconda/Anaconda is installed
-- If installed in a non-default location, edit the `CONDA_PATH` in `start.bat` or `start_sim.bat`
+- The launchers probe `%USERPROFILE%` and `%LOCALAPPDATA%` for `miniconda3` and
+  `anaconda3`, then `%PROGRAMDATA%\miniconda3`
+- If yours is somewhere else, set `CONDA_OVERRIDE` near the top of the `.bat`
+  to the full path of its `Scripts\activate.bat`
+
+### "No module named server"
+The backend package was never installed into the environment. Run
+`pip install -e ./bend --no-deps` with `patientgui` active (Manual Setup,
+Step 2). If it is installed but the error persists, an editable install from a
+*different* clone of this repo is winning — the launchers detect this and offer
+to repair it; see Step 2 for the manual check.
+
+### Port 8765 already in use
+A backend from an earlier run is still alive. The frontend would silently
+connect to it instead of the new one. Close the old **Backend Server** window,
+or find the owner with `netstat -ano | findstr :8765`.
 
 ### WebSocket connection failed
 - Verify the backend server is running
