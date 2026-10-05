@@ -1,0 +1,1 @@
+patientgui.macos.yml updated to add scikit-learn-extra to pip instead of conda to make compatible with macOS

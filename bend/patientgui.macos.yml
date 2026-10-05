@@ -22,9 +22,9 @@ channels:
 dependencies:
   - python=3.10
   - pip
-  - scikit-learn-extra=0.3.0
   - liblsl
   - pip:
+      - scikit-learn-extra==0.3.0 
       - aiofiles==24.1.0
       - annotated-types==0.7.0
       - anyio==4.11.0
