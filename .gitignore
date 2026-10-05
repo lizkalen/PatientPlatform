@@ -7,3 +7,6 @@ Thumbs.db
 
 # Simulation input data (EMG recordings — never commit subject data)
 /sim/
+
+# Results from decomp
+/results/
